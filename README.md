@@ -2,7 +2,7 @@
 
 Give your AI coding agent direct access to your live Blender scene.
 
-Blender Bridge is a lightweight Blender addon that opens a TCP socket so external tools — like [Claude Code](https://claude.com/claude-code), Cursor, Windsurf, or any CLI agent — can execute Python in your running Blender session. No MCP server, no Node.js, no complex setup. Install the addon, toggle it on, and your agent has full `bpy` API access.
+Blender Bridge is a lightweight Blender addon that opens a TCP socket so external tools — like Claude Code, Codex, Gemini, or any CLI agent — can execute Python with live updates in your running Blender session. No MCP server, no Node.js, no complex setup. Install the addon, toggle it on, and your agent has full `bpy` API access.
 
 ## Install
 
@@ -78,7 +78,7 @@ In **Edit > Preferences > Add-ons > Blender Bridge**:
 | Setting | Default | Description |
 |---|---|---|
 | Port | `9876` | TCP port (restart bridge to apply) |
-| Timeout | `60s` | Max execution time per command |
+| Timeout | `60s` | Max execution time per command (may need to be extended when conducting heavy tasks like rendering) |
 
 The `blender_exec.sh` helper respects `BLENDER_BRIDGE_PORT` and `BLENDER_BRIDGE_HOST` environment variables.
 
@@ -101,6 +101,7 @@ The `blender_exec.sh` helper respects `BLENDER_BRIDGE_PORT` and `BLENDER_BRIDGE_
 - **Localhost only** — the bridge binds to localhost; not designed for remote access
 - **Sequential** — one command at a time
 - **Security** — runs `exec()` on received code. Only use on trusted machines
+- **Experimental** — outcomes not always predictable; save important work frequently
 
 ---
 
