@@ -91,7 +91,7 @@ The `blender_exec.sh` helper respects `BLENDER_BRIDGE_PORT` and `BLENDER_BRIDGE_
 
 ## Strengths
 
-- **Minimal** — ~100 lines, no dependencies, no external processes
+- **Minimal** — ~200 lines, no dependencies, no external processes
 - **Full API access** — anything `bpy` can do, the bridge can do
 - **Safe execution** — runs on Blender's main thread via timer
 - **Zero config** — install, toggle on, connect
