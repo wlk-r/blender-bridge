@@ -167,13 +167,22 @@ class BRIDGE_OT_copy_instructions(bpy.types.Operator):
         addon_dir = os.path.dirname(__file__)
         exec_sh = os.path.join(addon_dir, "blender_exec.sh").replace("\\", "/")
 
-        template_path = os.path.join(addon_dir, "agent_instructions.md")
+        # Load global instructions (ships with addon)
+        global_path = os.path.join(addon_dir, "agent_instructions.md")
         try:
-            with open(template_path, "r", encoding="utf-8") as f:
+            with open(global_path, "r", encoding="utf-8") as f:
                 text = f.read()
         except FileNotFoundError:
             self.report({'ERROR'}, "agent_instructions.md not found in addon folder")
             return {'CANCELLED'}
+
+        # Append local instructions if present
+        local_path = os.path.join(addon_dir, "agent_instructions.local.md")
+        try:
+            with open(local_path, "r", encoding="utf-8") as f:
+                text += "\n\n" + f.read()
+        except FileNotFoundError:
+            pass
 
         text = text.replace("{{PORT}}", str(port))
         text = text.replace("{{EXEC_PATH}}", exec_sh)

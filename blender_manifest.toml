@@ -10,3 +10,13 @@ type = "add-on"
 blender_version_min = "4.2.0"
 
 license = ["SPDX:MIT"]
+
+[build]
+paths_exclude_pattern = [
+    "agent_instructions.local.md",
+    "CLAUDE.md",
+    "task_symlinkorjunction.md",
+    "__pycache__/",
+    "dist/",
+    "*.zip",
+]
