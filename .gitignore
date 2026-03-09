@@ -1,2 +1,4 @@
 CLAUDE.md
 __pycache__/
+dist/
+*.zip

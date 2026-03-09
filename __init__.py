@@ -1,12 +1,3 @@
-bl_info = {
-    "name": "Blender Bridge",
-    "author": "Walker Nosworthy",
-    "version": (1, 0, 0),
-    "blender": (4, 5, 0),
-    "category": "Development",
-    "description": "TCP socket bridge for remote Python execution",
-}
-
 import bpy
 import bpy.utils.previews
 import socket
@@ -143,22 +134,52 @@ def _poll():
     return POLL_INTERVAL
 
 
-# --- Operator ---
+# --- Operators ---
 
 class BRIDGE_OT_toggle(bpy.types.Operator):
     bl_idname = "bridge.toggle"
     bl_label = "Toggle Blender Bridge"
-    bl_description = "Start or stop the Blender Bridge socket server"
+    bl_description = "Click to toggle bridge. Ctrl+Click to copy agent instructions"
+
+    def invoke(self, context, event):
+        if event.ctrl:
+            return bpy.ops.bridge.copy_instructions()
+        return self.execute(context)
 
     def execute(self, context):
         if _active:
             _stop_server()
         else:
             _start_server()
-        # Redraw top bar to update button
         for area in context.screen.areas:
             if area.type == 'TOPBAR':
                 area.tag_redraw()
+        return {'FINISHED'}
+
+
+class BRIDGE_OT_copy_instructions(bpy.types.Operator):
+    bl_idname = "bridge.copy_instructions"
+    bl_label = "Copy Agent Instructions"
+    bl_description = "Copy startup instructions for your coding agent to the clipboard"
+
+    def execute(self, context):
+        port = _get_port()
+        addon_dir = os.path.dirname(__file__)
+        exec_sh = os.path.join(addon_dir, "blender_exec.sh").replace("\\", "/")
+
+        template_path = os.path.join(addon_dir, "agent_instructions.md")
+        try:
+            with open(template_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except FileNotFoundError:
+            self.report({'ERROR'}, "agent_instructions.md not found in addon folder")
+            return {'CANCELLED'}
+
+        text = text.replace("{{PORT}}", str(port))
+        text = text.replace("{{EXEC_PATH}}", exec_sh)
+
+        context.window_manager.clipboard = text
+        self.report({'INFO'}, "Agent instructions copied to clipboard")
         return {'FINISHED'}
 
 
@@ -190,6 +211,7 @@ class BridgePreferences(bpy.types.AddonPreferences):
         row.prop(self, "timeout")
         if _active:
             row.label(text="(restart bridge to apply port changes)")
+        layout.operator("bridge.copy_instructions", icon='COPYDOWN')
 
 
 # --- Top Bar UI ---
@@ -212,6 +234,7 @@ def register():
     _icon_collection.load("bridge_icon", icon_path, 'IMAGE')
 
     bpy.utils.register_class(BRIDGE_OT_toggle)
+    bpy.utils.register_class(BRIDGE_OT_copy_instructions)
     bpy.utils.register_class(BridgePreferences)
     bpy.types.TOPBAR_HT_upper_bar.append(_draw_topbar)
 
@@ -221,6 +244,7 @@ def unregister():
     _stop_server()
     bpy.types.TOPBAR_HT_upper_bar.remove(_draw_topbar)
     bpy.utils.unregister_class(BridgePreferences)
+    bpy.utils.unregister_class(BRIDGE_OT_copy_instructions)
     bpy.utils.unregister_class(BRIDGE_OT_toggle)
     if _icon_collection:
         bpy.utils.previews.remove(_icon_collection)
