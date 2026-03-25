@@ -3,7 +3,7 @@ schema_version = "1.0.0"
 id = "blender_bridge"
 version = "1.0.0"
 name = "Blender Bridge"
-tagline = "TCP socket bridge for remote Python execution"
+tagline = "HTTP bridge for remote Python execution"
 maintainer = "Walker Nosworthy"
 type = "add-on"
 

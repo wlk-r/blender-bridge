@@ -1,16 +1,23 @@
 import bpy
 import bpy.utils.previews
-import socket
-import struct
-import json
 import io
+import json
 import os
+import queue
 import sys
+import threading
+import time
 import traceback
+from itertools import count
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-_server: socket.socket | None = None
+_server: HTTPServer | None = None
+_server_thread: threading.Thread | None = None
 _active = False
 _icon_collection = None
+_request_ids = count(1)
+request_queue: queue.Queue[tuple[int, str]] = queue.Queue()
+response_queue: queue.Queue[tuple[int, dict]] = queue.Queue()
 POLL_INTERVAL = 0.1
 
 
@@ -28,44 +35,129 @@ def _get_port():
 
 def _get_timeout():
     prefs = _get_prefs()
-    return prefs.timeout if prefs else 5.0
+    return prefs.timeout if prefs else 60.0
+
+
+def _clear_queue(q):
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
+
+def _execute_code(code):
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = stdout_buf, stderr_buf
+
+    try:
+        exec(code, {"__builtins__": __builtins__, "bpy": bpy})
+        return {
+            "ok": True,
+            "stdout": stdout_buf.getvalue(),
+            "stderr": stderr_buf.getvalue(),
+        }
+    except Exception:
+        return {
+            "ok": False,
+            "error": traceback.format_exc(),
+            "stdout": stdout_buf.getvalue(),
+            "stderr": stderr_buf.getvalue(),
+        }
+    finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+
+
+class _BridgeHandler(BaseHTTPRequestHandler):
+    server_version = "BlenderBridge/1.0"
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._write_json(400, {"ok": False, "error": "Invalid Content-Length"})
+            return
+
+        if length <= 0:
+            self._write_json(400, {"ok": False, "error": "Request body is required"})
+            return
+
+        try:
+            code = self.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError:
+            self._write_json(400, {"ok": False, "error": "Request body must be UTF-8"})
+            return
+
+        request_id = next(_request_ids)
+        request_queue.put((request_id, code))
+
+        try:
+            deadline = time.monotonic() + _get_timeout()
+            while True:
+                timeout = max(0.0, deadline - time.monotonic())
+                response_id, result = response_queue.get(timeout=timeout)
+                if response_id == request_id:
+                    self._write_json(200, result)
+                    return
+        except queue.Empty:
+            timeout_val = _get_timeout()
+            self._write_json(
+                504,
+                {
+                    "ok": False,
+                    "error": (
+                        f"Bridge timeout: command exceeded {timeout_val:.0f}s limit. "
+                        "Increase timeout in addon preferences "
+                        "(Edit > Preferences > Add-ons > Blender Bridge) if running long operations."
+                    ),
+                },
+            )
+
+    def log_message(self, format, *args):
+        return
+
+    def _write_json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def _start_server():
-    global _server, _active
+    global _server, _server_thread, _active
     if _server is not None:
         return
     port = _get_port()
-    _server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    _server.bind(("localhost", port))
-    _server.listen(1)
-    _server.setblocking(False)
+    _clear_queue(request_queue)
+    _clear_queue(response_queue)
+    _server = HTTPServer(("localhost", port), _BridgeHandler)
+    _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
+    _server_thread.start()
     _active = True
     if not bpy.app.timers.is_registered(_poll):
         bpy.app.timers.register(_poll, first_interval=POLL_INTERVAL, persistent=True)
-    print(f"Blender Bridge listening on localhost:{port}")
+    print(f"Blender Bridge listening for HTTP POST on http://localhost:{port}")
 
 
 def _stop_server():
-    global _server, _active
+    global _server, _server_thread, _active
     if bpy.app.timers.is_registered(_poll):
         bpy.app.timers.unregister(_poll)
     if _server is not None:
-        _server.close()
+        _server.shutdown()
+        _server.server_close()
         _server = None
+    if _server_thread is not None:
+        _server_thread.join(timeout=1.0)
+        _server_thread = None
+    _clear_queue(request_queue)
+    _clear_queue(response_queue)
     _active = False
     print("Blender Bridge stopped")
-
-
-def _recv_exact(conn, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = conn.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("connection closed")
-        buf += chunk
-    return buf
 
 
 def _poll():
@@ -73,64 +165,11 @@ def _poll():
         return None
 
     try:
-        conn, _ = _server.accept()
-    except BlockingIOError:
+        request_id, code = request_queue.get_nowait()
+    except queue.Empty:
         return POLL_INTERVAL
 
-    try:
-        conn.setblocking(True)
-        conn.settimeout(_get_timeout())
-
-        hdr = _recv_exact(conn, 4)
-        size = struct.unpack(">I", hdr)[0]
-        code = _recv_exact(conn, size).decode("utf-8")
-
-        stdout_buf = io.StringIO()
-        stderr_buf = io.StringIO()
-        old_stdout, old_stderr = sys.stdout, sys.stderr
-        sys.stdout, sys.stderr = stdout_buf, stderr_buf
-
-        try:
-            exec(code, {"__builtins__": __builtins__, "bpy": bpy})
-            result = {
-                "ok": True,
-                "stdout": stdout_buf.getvalue(),
-                "stderr": stderr_buf.getvalue(),
-            }
-        except Exception:
-            result = {
-                "ok": False,
-                "error": traceback.format_exc(),
-                "stdout": stdout_buf.getvalue(),
-                "stderr": stderr_buf.getvalue(),
-            }
-        finally:
-            sys.stdout, sys.stderr = old_stdout, old_stderr
-
-        payload = json.dumps(result).encode("utf-8")
-        conn.sendall(struct.pack(">I", len(payload)) + payload)
-    except socket.timeout:
-        timeout_val = _get_timeout()
-        msg = (
-            f"Bridge timeout: command exceeded {timeout_val:.0f}s limit. "
-            f"Increase timeout in addon preferences (Edit > Preferences > Add-ons > Blender Bridge) "
-            f"if running long operations."
-        )
-        print(f"[Blender Bridge] {msg}")
-        try:
-            err = json.dumps({"ok": False, "error": msg}).encode("utf-8")
-            conn.sendall(struct.pack(">I", len(err)) + err)
-        except Exception:
-            pass
-    except Exception as e:
-        try:
-            err = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
-            conn.sendall(struct.pack(">I", len(err)) + err)
-        except Exception:
-            pass
-    finally:
-        conn.close()
-
+    response_queue.put((request_id, _execute_code(code)))
     return POLL_INTERVAL
 
 
@@ -171,7 +210,6 @@ class BRIDGE_OT_copy_instructions(bpy.types.Operator):
     def _copy(context):
         port = _get_port()
         addon_dir = os.path.dirname(__file__)
-        exec_sh = os.path.join(addon_dir, "blender_exec.sh").replace("\\", "/")
 
         # Load global instructions (ships with addon)
         global_path = os.path.join(addon_dir, "agent_instructions.md")
@@ -190,7 +228,6 @@ class BRIDGE_OT_copy_instructions(bpy.types.Operator):
             pass
 
         text = text.replace("{{PORT}}", str(port))
-        text = text.replace("{{EXEC_PATH}}", exec_sh)
 
         context.window_manager.clipboard = text
         return {'FINISHED'}
@@ -214,7 +251,7 @@ class BridgePreferences(bpy.types.AddonPreferences):
         default=9876,
         min=1024,
         max=65535,
-        description="TCP port for the bridge socket",
+        description="HTTP port for the Blender bridge server",
     )
 
     timeout: bpy.props.FloatProperty(
