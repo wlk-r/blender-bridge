@@ -143,7 +143,12 @@ class BRIDGE_OT_toggle(bpy.types.Operator):
 
     def invoke(self, context, event):
         if event.ctrl:
-            return bpy.ops.bridge.copy_instructions()
+            result = BRIDGE_OT_copy_instructions._copy(context)
+            if result == {'CANCELLED'}:
+                self.report({'ERROR'}, "agent_instructions.md not found in addon folder")
+            else:
+                self.report({'INFO'}, "Agent instructions copied to clipboard")
+            return result
         return self.execute(context)
 
     def execute(self, context):
@@ -162,7 +167,8 @@ class BRIDGE_OT_copy_instructions(bpy.types.Operator):
     bl_label = "Copy Agent Instructions"
     bl_description = "Copy startup instructions for your coding agent to the clipboard"
 
-    def execute(self, context):
+    @staticmethod
+    def _copy(context):
         port = _get_port()
         addon_dir = os.path.dirname(__file__)
         exec_sh = os.path.join(addon_dir, "blender_exec.sh").replace("\\", "/")
@@ -173,7 +179,6 @@ class BRIDGE_OT_copy_instructions(bpy.types.Operator):
             with open(global_path, "r", encoding="utf-8") as f:
                 text = f.read()
         except FileNotFoundError:
-            self.report({'ERROR'}, "agent_instructions.md not found in addon folder")
             return {'CANCELLED'}
 
         # Append local instructions if present
@@ -188,8 +193,15 @@ class BRIDGE_OT_copy_instructions(bpy.types.Operator):
         text = text.replace("{{EXEC_PATH}}", exec_sh)
 
         context.window_manager.clipboard = text
-        self.report({'INFO'}, "Agent instructions copied to clipboard")
         return {'FINISHED'}
+
+    def execute(self, context):
+        result = self._copy(context)
+        if result == {'CANCELLED'}:
+            self.report({'ERROR'}, "agent_instructions.md not found in addon folder")
+        else:
+            self.report({'INFO'}, "Agent instructions copied to clipboard")
+        return result
 
 
 # --- Preferences ---
