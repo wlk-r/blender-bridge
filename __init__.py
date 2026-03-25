@@ -1,6 +1,5 @@
 import bpy
 import bpy.utils.previews
-import io
 import json
 import os
 import queue
@@ -16,9 +15,9 @@ _server_thread: threading.Thread | None = None
 _active = False
 _icon_collection = None
 _request_ids = count(1)
-request_queue: queue.Queue[tuple[int, str]] = queue.Queue()
-response_queue: queue.Queue[tuple[int, dict]] = queue.Queue()
+request_queue: queue.Queue[tuple[int, str, queue.Queue]] = queue.Queue()
 POLL_INTERVAL = 0.1
+_STREAM_DONE = "done"
 
 
 def _get_prefs():
@@ -46,26 +45,31 @@ def _clear_queue(q):
             return
 
 
-def _execute_code(code):
-    stdout_buf = io.StringIO()
-    stderr_buf = io.StringIO()
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout, sys.stderr = stdout_buf, stderr_buf
+class _StreamWriter:
+    """File-like that pushes each write() into a queue for real-time streaming."""
 
+    def __init__(self, stream_queue, channel):
+        self._q = stream_queue
+        self._ch = channel
+
+    def write(self, text):
+        if text:
+            self._q.put((self._ch, text))
+        return len(text) if text else 0
+
+    def flush(self):
+        pass
+
+
+def _execute_code(code, stream_q):
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.stdout = _StreamWriter(stream_q, "stdout")
+    sys.stderr = _StreamWriter(stream_q, "stderr")
     try:
         exec(code, {"__builtins__": __builtins__, "bpy": bpy})
-        return {
-            "ok": True,
-            "stdout": stdout_buf.getvalue(),
-            "stderr": stderr_buf.getvalue(),
-        }
+        stream_q.put((_STREAM_DONE, {"ok": True}))
     except Exception:
-        return {
-            "ok": False,
-            "error": traceback.format_exc(),
-            "stdout": stdout_buf.getvalue(),
-            "stderr": stderr_buf.getvalue(),
-        }
+        stream_q.put((_STREAM_DONE, {"ok": False, "error": traceback.format_exc()}))
     finally:
         sys.stdout, sys.stderr = old_stdout, old_stderr
 
@@ -90,30 +94,97 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             self._write_json(400, {"ok": False, "error": "Request body must be UTF-8"})
             return
 
-        request_id = next(_request_ids)
-        request_queue.put((request_id, code))
+        stream_q = queue.Queue()
+        request_queue.put((next(_request_ids), code, stream_q))
 
+        accept = self.headers.get("Accept", "")
+        if "application/x-ndjson" in accept:
+            self._do_streaming(stream_q)
+        else:
+            self._do_buffered(stream_q)
+
+    # -- Streaming: chunked NDJSON, real-time output --------------------
+
+    def _do_streaming(self, stream_q):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        deadline = time.monotonic() + _get_timeout()
         try:
-            deadline = time.monotonic() + _get_timeout()
             while True:
-                timeout = max(0.0, deadline - time.monotonic())
-                response_id, result = response_queue.get(timeout=timeout)
-                if response_id == request_id:
-                    self._write_json(200, result)
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    channel, data = stream_q.get(timeout=remaining)
+                except queue.Empty:
+                    timeout_val = _get_timeout()
+                    self._write_chunk(json.dumps({
+                        "channel": "result",
+                        "ok": False,
+                        "error": (
+                            f"Bridge timeout: command exceeded {timeout_val:.0f}s limit. "
+                            "Increase timeout in addon preferences."
+                        ),
+                    }) + "\n")
                     return
-        except queue.Empty:
-            timeout_val = _get_timeout()
-            self._write_json(
-                504,
-                {
+
+                if channel == _STREAM_DONE:
+                    self._write_chunk(
+                        json.dumps({"channel": "result", **data}) + "\n"
+                    )
+                    return
+                else:
+                    self._write_chunk(
+                        json.dumps({"channel": channel, "data": data}) + "\n"
+                    )
+        finally:
+            self._end_chunked()
+
+    def _write_chunk(self, text):
+        encoded = text.encode("utf-8")
+        self.wfile.write(f"{len(encoded):x}\r\n".encode())
+        self.wfile.write(encoded)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+
+    def _end_chunked(self):
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+    # -- Buffered: classic single JSON response -------------------------
+
+    def _do_buffered(self, stream_q):
+        deadline = time.monotonic() + _get_timeout()
+        stdout_parts = []
+        stderr_parts = []
+
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                channel, data = stream_q.get(timeout=remaining)
+            except queue.Empty:
+                timeout_val = _get_timeout()
+                self._write_json(504, {
                     "ok": False,
                     "error": (
                         f"Bridge timeout: command exceeded {timeout_val:.0f}s limit. "
                         "Increase timeout in addon preferences "
-                        "(Edit > Preferences > Add-ons > Blender Bridge) if running long operations."
+                        "(Edit > Preferences > Add-ons > Blender Bridge) "
+                        "if running long operations."
                     ),
-                },
-            )
+                })
+                return
+
+            if channel == _STREAM_DONE:
+                data["stdout"] = "".join(stdout_parts)
+                data["stderr"] = "".join(stderr_parts)
+                self._write_json(200, data)
+                return
+            elif channel == "stdout":
+                stdout_parts.append(data)
+            elif channel == "stderr":
+                stderr_parts.append(data)
 
     def log_message(self, format, *args):
         return
@@ -133,7 +204,6 @@ def _start_server():
         return
     port = _get_port()
     _clear_queue(request_queue)
-    _clear_queue(response_queue)
     _server = HTTPServer(("localhost", port), _BridgeHandler)
     _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
     _server_thread.start()
@@ -155,7 +225,6 @@ def _stop_server():
         _server_thread.join(timeout=1.0)
         _server_thread = None
     _clear_queue(request_queue)
-    _clear_queue(response_queue)
     _active = False
     print("Blender Bridge stopped")
 
@@ -165,11 +234,11 @@ def _poll():
         return None
 
     try:
-        request_id, code = request_queue.get_nowait()
+        request_id, code, stream_q = request_queue.get_nowait()
     except queue.Empty:
         return POLL_INTERVAL
 
-    response_queue.put((request_id, _execute_code(code)))
+    _execute_code(code, stream_q)
     return POLL_INTERVAL
 
 

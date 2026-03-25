@@ -4,3 +4,4 @@ dist/
 *.zip
 agent_instructions.local.md
 task_symlinkorjunction.md
+RELEASE.md
