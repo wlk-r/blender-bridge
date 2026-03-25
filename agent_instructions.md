@@ -35,3 +35,11 @@ Full `bpy` API access - query scene state, create/modify objects, run operators,
 - **Avoid `bpy.ops.object.select_all`** - it polls for `VIEW_3D` and may fail. Use `obj.select_set(True/False)` directly.
 - **Multi-line scripts work** - send full multi-line Python, not just one-liners. Use try/except for useful error info.
 - **Timeout** - commands time out after 60s by default. Long operations (rendering, complex scripts) may need the limit increased in addon preferences.
+
+### Known gotchas
+
+- **Do not use `time.sleep()`** - it only pauses Blender's main thread and freezes the UI; it does not help Blender "wait" more safely.
+- **Do not poll with retry loops** - repeated `while` loops waiting for state changes will also freeze the UI.
+- **Do not "wait for render" manually** - synchronous calls like `bpy.ops.render.render()` already block until finished, so a sleep afterward is useless.
+- **Do not assume context-heavy operators always work** - many `bpy.ops` calls require the right mode, selection, active object, or area type.
+- **Do not send giant monolithic scripts by default** - short, targeted calls are easier to reason about and less likely to lock Blender for a long time.
