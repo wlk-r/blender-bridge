@@ -75,7 +75,7 @@ def _execute_code(code, stream_q):
 
 
 class _BridgeHandler(BaseHTTPRequestHandler):
-    server_version = "BlenderBridge/1.0"
+    server_version = "BlenderBridge/1.1"
 
     def do_POST(self):
         try:
