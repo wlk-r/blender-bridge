@@ -1,5 +1,6 @@
 import bpy
 import bpy.utils.previews
+import errno
 import json
 import os
 import queue
@@ -7,12 +8,16 @@ import sys
 import threading
 import time
 import traceback
-from itertools import count
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from bpy.app.handlers import persistent
+from itertools import chain, count
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-_server: HTTPServer | None = None
+_server: ThreadingHTTPServer | None = None
 _server_thread: threading.Thread | None = None
 _active = False
+_restart_after_load = False
+_retired_ports = set()
+_queue_lock = threading.Lock()
 _icon_collection = None
 _request_ids = count(1)
 request_queue: queue.Queue[tuple[int, str, queue.Queue]] = queue.Queue()
@@ -28,6 +33,8 @@ def _get_prefs():
 
 
 def _get_port():
+    if _server is not None:
+        return _server.server_port
     prefs = _get_prefs()
     return prefs.port if prefs else 9876
 
@@ -75,7 +82,7 @@ def _execute_code(code, stream_q):
 
 
 class _BridgeHandler(BaseHTTPRequestHandler):
-    server_version = "BlenderBridge/1.1"
+    server_version = "BlenderBridge/1.2"
 
     def do_POST(self):
         try:
@@ -95,7 +102,11 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             return
 
         stream_q = queue.Queue()
-        request_queue.put((next(_request_ids), code, stream_q))
+        with _queue_lock:
+            if self.server is not _server:
+                self._write_json(503, {"ok": False, "error": "Bridge stopped; copy fresh instructions"})
+                return
+            request_queue.put((next(_request_ids), code, stream_q))
 
         accept = self.headers.get("Accept", "")
         if "application/x-ndjson" in accept:
@@ -204,23 +215,40 @@ def _start_server():
         return
     port = _get_port()
     _clear_queue(request_queue)
-    _server = HTTPServer(("localhost", port), _BridgeHandler)
+    # Bind directly: probing then binding would race other Blender instances.
+    for candidate in chain(range(port, 65536), range(1024, port)):
+        if candidate in _retired_ports:
+            continue
+        try:
+            _server = ThreadingHTTPServer(("127.0.0.1", candidate), _BridgeHandler)
+            break
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+    else:
+        raise OSError("No available Blender Bridge port")
+    port = _server.server_port
     _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
     _server_thread.start()
     _active = True
     if not bpy.app.timers.is_registered(_poll):
         bpy.app.timers.register(_poll, first_interval=POLL_INTERVAL, persistent=True)
-    print(f"Blender Bridge listening for HTTP POST on http://localhost:{port}")
+    print(f"Blender Bridge listening for HTTP POST on http://127.0.0.1:{port}")
 
 
 def _stop_server():
     global _server, _server_thread, _active
     if bpy.app.timers.is_registered(_poll):
         bpy.app.timers.unregister(_poll)
-    if _server is not None:
-        _server.shutdown()
-        _server.server_close()
+    with _queue_lock:
+        server = _server
         _server = None
+        while not request_queue.empty():
+            _, _, stream_q = request_queue.get_nowait()
+            stream_q.put((_STREAM_DONE, {"ok": False, "error": "Bridge stopped before execution"}))
+    if server is not None:
+        server.shutdown()
+        server.server_close()
     if _server_thread is not None:
         _server_thread.join(timeout=1.0)
         _server_thread = None
@@ -242,6 +270,26 @@ def _poll():
     return POLL_INTERVAL
 
 
+@persistent
+def _load_pre(_filepath):
+    global _restart_after_load
+    _restart_after_load = _active
+    if _active:
+        _retired_ports.add(_get_port())
+        _stop_server()
+
+
+@persistent
+def _load_post(_filepath):
+    global _restart_after_load
+    if _restart_after_load:
+        _restart_after_load = False
+        try:
+            _start_server()
+        except OSError as exc:
+            print(f"Blender Bridge could not restart: {exc}")
+
+
 # --- Operators ---
 
 class BRIDGE_OT_toggle(bpy.types.Operator):
@@ -253,7 +301,7 @@ class BRIDGE_OT_toggle(bpy.types.Operator):
         if event.ctrl:
             result = BRIDGE_OT_copy_instructions._copy(context)
             if result == {'CANCELLED'}:
-                self.report({'ERROR'}, "agent_instructions.md not found in addon folder")
+                self.report({'ERROR'}, "Start the bridge first and ensure agent_instructions.md exists in the addon folder")
             else:
                 self.report({'INFO'}, "Agent instructions copied to clipboard")
             return result
@@ -263,7 +311,11 @@ class BRIDGE_OT_toggle(bpy.types.Operator):
         if _active:
             _stop_server()
         else:
-            _start_server()
+            try:
+                _start_server()
+            except OSError as exc:
+                self.report({'ERROR'}, f"Could not start Blender Bridge: {exc}")
+                return {'CANCELLED'}
         for area in context.screen.areas:
             if area.type == 'TOPBAR':
                 area.tag_redraw()
@@ -277,6 +329,8 @@ class BRIDGE_OT_copy_instructions(bpy.types.Operator):
 
     @staticmethod
     def _copy(context):
+        if not _active:
+            return {'CANCELLED'}
         port = _get_port()
         addon_dir = os.path.dirname(__file__)
 
@@ -297,6 +351,8 @@ class BRIDGE_OT_copy_instructions(bpy.types.Operator):
             pass
 
         text = text.replace("{{PORT}}", str(port))
+        text = text.replace("{{FILE}}", json.dumps(bpy.data.filepath or "(unsaved)", ensure_ascii=False))
+        text = text.replace("{{TIMEOUT}}", f"{_get_timeout():g}")
 
         context.window_manager.clipboard = text
         return {'FINISHED'}
@@ -304,7 +360,7 @@ class BRIDGE_OT_copy_instructions(bpy.types.Operator):
     def execute(self, context):
         result = self._copy(context)
         if result == {'CANCELLED'}:
-            self.report({'ERROR'}, "agent_instructions.md not found in addon folder")
+            self.report({'ERROR'}, "Start the bridge first and ensure agent_instructions.md exists in the addon folder")
         else:
             self.report({'INFO'}, "Agent instructions copied to clipboard")
         return result
@@ -320,7 +376,7 @@ class BridgePreferences(bpy.types.AddonPreferences):
         default=9876,
         min=1024,
         max=65535,
-        description="HTTP port for the Blender bridge server",
+        description="Preferred starting port; occupied ports are skipped automatically",
     )
 
     timeout: bpy.props.FloatProperty(
@@ -328,7 +384,7 @@ class BridgePreferences(bpy.types.AddonPreferences):
         default=60.0,
         min=1.0,
         soft_max=3600.0,
-        description="Max execution time per command before timeout",
+        description="HTTP response wait limit; timeout does not cancel Python execution",
     )
 
     def draw(self, context):
@@ -349,7 +405,7 @@ def _draw_topbar(self, context):
     layout = self.layout
     icon_id = _icon_collection["bridge_icon"].icon_id if _icon_collection else 0
     if _active:
-        layout.operator("bridge.toggle", text="", icon_value=icon_id, depress=True)
+        layout.operator("bridge.toggle", text=str(_get_port()), icon_value=icon_id, depress=True)
     else:
         layout.operator("bridge.toggle", text="", icon_value=icon_id)
 
@@ -364,11 +420,19 @@ def register():
     bpy.utils.register_class(BRIDGE_OT_copy_instructions)
     bpy.utils.register_class(BridgePreferences)
     bpy.types.TOPBAR_HT_upper_bar.append(_draw_topbar)
+    bpy.app.handlers.load_pre.append(_load_pre)
+    bpy.app.handlers.load_post.append(_load_post)
+    bpy.app.handlers.load_post_fail.append(_load_post)
 
 
 def unregister():
     global _icon_collection
+    global _restart_after_load
+    _restart_after_load = False
     _stop_server()
+    bpy.app.handlers.load_pre.remove(_load_pre)
+    bpy.app.handlers.load_post.remove(_load_post)
+    bpy.app.handlers.load_post_fail.remove(_load_post)
     bpy.types.TOPBAR_HT_upper_bar.remove(_draw_topbar)
     bpy.utils.unregister_class(BridgePreferences)
     bpy.utils.unregister_class(BRIDGE_OT_copy_instructions)

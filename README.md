@@ -12,17 +12,21 @@ Blender Bridge is a lightweight Blender addon that opens a local HTTP server so 
 
 ## Usage
 
-1. Click the bridge icon in the top-right of the top bar to start the server
+1. Click the bridge icon in the top-right of the top bar to start the server. Its active port appears beside the icon.
 2. **Ctrl+Click** the same icon to copy the agent instructions to your clipboard
 3. Paste those instructions into your coding agent's context (chat, project docs, etc.)
 4. Your agent can now talk to Blender
 
-That's it. The agent instructions tell your coding agent everything it needs to know about the HTTP protocol, safety rules, and Blender-specific gotchas.
+Open each file in a separate Blender process and enable its bridge to work with multiple files simultaneously. Each bridge binds its own available port, starting at the preferred port and skipping occupied ports. Ctrl-click copies the actual port, current file, and timeout; the bridge must be active. Loading another file in an active process rotates its port, so copy fresh instructions afterward. Saving or renaming the current file keeps its port.
+
+The agent instructions tell your coding agent everything it needs to know about the HTTP protocol, safety rules, and Blender-specific gotchas.
 
 ### Quick test
 
+Replace `9876` with the port displayed in Blender.
+
 ```bash
-curl -X POST http://localhost:9876 -d 'print(bpy.data.objects.keys())'
+curl -X POST http://127.0.0.1:9876 -d 'print(bpy.data.objects.keys())'
 ```
 
 ## Agent Instructions
@@ -40,8 +44,8 @@ In **Edit > Preferences > Add-ons > Blender Bridge**:
 
 | Setting | Default | Description |
 |---|---|---|
-| Port | `9876` | HTTP port (restart bridge to apply) |
-| Timeout | `60s` | Max execution time per command |
+| Port | `9876` | Preferred starting port; skips occupied ports (restart to apply) |
+| Timeout | `60s` | Response wait limit; does not cancel execution |
 
 ## Limitations
 
