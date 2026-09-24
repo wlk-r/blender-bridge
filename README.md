@@ -40,7 +40,9 @@ The addon ships with two instruction files that get copied to the agent's contex
 
 ## Visual feedback
 
-For an occasional visual check, have the agent request a viewport render rather than a full engine render. `render.opengl` draws the scene the way the 3D viewport does, so it finishes in milliseconds regardless of Cycles settings, and the resolution is set explicitly to keep the image small. The agent then reads the PNG with its own file tool.
+When a visual check is necessary or helpful, use the fastest suitable method: a viewport screenshot for quick checks, a viewport render for a clean preview, or an engine render for final appearance. Prefer inspecting scene data to analyze progress unless visual verification is directly applicable.
+
+For a viewport render, the example below uses `render.opengl` with an explicit small resolution. The agent then reads the PNG with its own file tool.
 
 ```python
 import bpy, os, tempfile
