@@ -38,6 +38,30 @@ The addon ships with two instruction files that get copied to the agent's contex
 | `agent_instructions.md` | Global instructions shared with every agent. Covers the HTTP protocol, safety rules, tips, and gotchas. Edit with care — changes affect all agents. |
 | `agent_instructions.local.md` | Optional. Your personal preferences, project-specific prompts, or extra context. Create this file in the addon folder to append to the global instructions. Not tracked by git. |
 
+## Visual feedback
+
+For an occasional visual check, have the agent request a viewport render rather than a full engine render. `render.opengl` draws the scene the way the 3D viewport does, so it finishes in milliseconds regardless of Cycles settings, and the resolution is set explicitly to keep the image small. The agent then reads the PNG with its own file tool.
+
+```python
+import bpy, os, tempfile
+path = os.path.join(tempfile.gettempdir(), "bridge_view.png")
+win = bpy.context.window_manager.windows[0]
+area = next(a for a in win.screen.areas if a.type == 'VIEW_3D')
+region = next(r for r in area.regions if r.type == 'WINDOW')
+r = bpy.context.scene.render
+saved = (r.resolution_x, r.resolution_y, r.resolution_percentage, r.filepath, r.image_settings.file_format)
+r.resolution_x, r.resolution_y, r.resolution_percentage = 960, 540, 100
+r.image_settings.file_format, r.filepath = 'PNG', path
+try:
+    with bpy.context.temp_override(window=win, area=area, region=region):
+        bpy.ops.render.opengl(write_still=True, view_context=True)
+finally:
+    r.resolution_x, r.resolution_y, r.resolution_percentage, r.filepath, r.image_settings.file_format = saved
+print(path)
+```
+
+`view_context=True` renders what the viewport currently shows. Set it to `False` to render from the scene camera instead. Image cost scales with pixel area, so lower the resolution for quick sanity checks.
+
 ## Settings
 
 In **Edit > Preferences > Add-ons > Blender Bridge**:
