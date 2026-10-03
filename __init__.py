@@ -4,6 +4,8 @@ import errno
 import json
 import os
 import queue
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -290,14 +292,58 @@ def _load_post(_filepath):
             print(f"Blender Bridge could not restart: {exc}")
 
 
+# --- Terminal ---
+
+def _terminal_dir():
+    if bpy.data.filepath:
+        return os.path.dirname(bpy.data.filepath)
+    path = os.path.join(os.path.expanduser("~"), "Documents", "blender-bridge-sessions")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _open_terminal():
+    path = _terminal_dir()
+    if sys.platform == "darwin":
+        # Both apps open a new window at a folder passed as a document.
+        has_ghostty = subprocess.run(["open", "-Ra", "Ghostty"], capture_output=True).returncode == 0
+        subprocess.run(["open", "-a", "Ghostty" if has_ghostty else "Terminal", path], check=True)
+    elif sys.platform == "win32":
+        subprocess.Popen(["powershell.exe", "-NoExit"], cwd=path,
+                         creationflags=subprocess.CREATE_NEW_CONSOLE)
+    else:
+        for term in ("ghostty", "x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
+            if shutil.which(term):
+                subprocess.Popen([term], cwd=path)
+                break
+        else:
+            raise OSError("No terminal emulator found")
+    return path
+
+
 # --- Operators ---
 
 class BRIDGE_OT_toggle(bpy.types.Operator):
     bl_idname = "bridge.toggle"
     bl_label = "Toggle Blender Bridge"
-    bl_description = "Click to toggle bridge. Ctrl+Click to copy agent instructions"
+    bl_description = (
+        "Click to toggle bridge. Ctrl+Click to copy agent instructions. "
+        "Ctrl+Alt+Click to activate bridge and open a terminal in the project folder"
+    )
 
     def invoke(self, context, event):
+        if event.ctrl and event.alt:
+            if not _active:
+                result = self.execute(context)
+                if result == {'CANCELLED'}:
+                    return result
+            try:
+                path = _open_terminal()
+            except (OSError, subprocess.SubprocessError) as exc:
+                self.report({'ERROR'}, f"Could not open terminal: {exc}")
+                return {'CANCELLED'}
+            self.report({'INFO'}, f"Opened terminal in {path}")
+            return {'FINISHED'}
         if event.ctrl:
             result = BRIDGE_OT_copy_instructions._copy(context)
             if result == {'CANCELLED'}:

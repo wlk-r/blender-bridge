@@ -19,6 +19,8 @@ Blender Bridge is a lightweight Blender addon that opens a local HTTP server so 
 
 Open each file in a separate Blender process and enable its bridge to work with multiple files simultaneously. Each bridge binds its own available port, starting at the preferred port and skipping occupied ports. Ctrl-click copies the actual port, current file, and timeout; the bridge must be active. Loading another file in an active process rotates its port, so copy fresh instructions afterward. Saving or renaming the current file keeps its port.
 
+**Ctrl+Alt+Click** the icon to activate Bridge if needed and open a terminal in the current file's folder (or `~/Documents/blender-bridge-sessions` if the file is unsaved), ready to launch your agent. Bridge stays active if it is already running. macOS uses Ghostty when installed, otherwise Terminal; Windows opens PowerShell; Linux tries Ghostty, then common terminal emulators.
+
 The agent instructions tell your coding agent everything it needs to know about the HTTP protocol, safety rules, and Blender-specific gotchas.
 
 ### Quick test
