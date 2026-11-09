@@ -76,7 +76,6 @@ try:
     first._start_server()
     second._start_server()
     assert len({preferred, first._get_port(), second._get_port()}) == 3
-    assert first._server.token != second._server.token
 
     # Plain text by default: the body is what the script printed, the status says how it went.
     assert request(first, 'print("first")') == (200, 'first\n')
@@ -131,22 +130,25 @@ try:
     status, body = request(first, 'print(bridge.look())')
     assert status == 500 and "need Blender's window" in body, body
 
-    # Only the copied URL works: no token, another session's token and web pages are refused, unrun.
-    base = f'http://127.0.0.1:{first._get_port()}'
+    # Web pages are refused, unrun: a cross-site POST carries Origin, a rebound domain names itself in Host.
     marker = 'import bpy; bpy.app.driver_namespace["bridge_test_ran"] = True'
-    for url, headers in (
-        (base, None),
-        (f'{base}/{second._server.token}', None),
-        (first._url(), {'Origin': 'https://example.com'}),
-    ):
-        status, body = fetch(url, marker, headers)
-        assert status == 403 and body.startswith('[bridge]'), (url, status, body)
-    assert fetch(base)[0] == 403
+    for headers in ({'Origin': 'https://example.com'}, {'Host': f'evil.example:{first._get_port()}'}):
+        status, body = fetch(first._url(), marker, headers)
+        assert status == 403 and body.startswith('[bridge]'), (headers, status, body)
+        assert fetch(f'{first._url()}/result/1', headers=headers)[0] == 403
     assert first.request_queue.empty() and 'bridge_test_ran' not in bpy.app.driver_namespace
+    assert request(first, 'print("local")', None) == (200, 'local\n')
+    assert fetch(f'http://localhost:{first._get_port()}/status')[0] == 200
+
+    # The port alone is enough: a plain GET returns the instructions, filled in for this bridge.
+    first._poll()
+    status, body = fetch(first._url())
+    assert status == 200 and f'`{first._url()}`' in body and 'POST Python source' in body and '{{' not in body
+    assert fetch(first._url(), '')[0] == 400 and fetch(f'{first._url()}/nowhere')[0] == 404
 
     # Status is answered without Blender's main thread.
     first._poll()
-    status, body = fetch(first._url())
+    status, body = fetch(f'{first._url()}/status')
     state = json.loads(body)
     assert status == 200 and state['running'] is None and state['queued'] == 0 and not state['busy'], state
     assert state['blender'] == bpy.app.version_string and state['timeout'] == 2
@@ -187,9 +189,8 @@ try:
     prefs.port = preferred
 
     # Exercise real file-load callbacks, including persistent registration.
-    old_token = first._server.token
     bpy.ops.wm.read_homefile(use_empty=True)
-    assert first._active and first._get_port() != bound_port and first._server.token != old_token
+    assert first._active and first._get_port() != bound_port
     assert bound_port in first._retired_ports
     assert request(first, 'print(len(bpy.data.objects))') == (200, '0\n')
     # Loading a file from a request must not deadlock shutdown, and the reply says where the bridge went.
@@ -215,7 +216,7 @@ try:
         else:
             raise AssertionError('Expected permission error')
     assert first._server is None and not first._active
-    print('PASS: ports, tokens, text/JSON/streaming replies, errors, exit guard, undo steps, helpers, status, '
+    print('PASS: ports, text/JSON/streaming replies, web-page refusal, self-description, errors, exit guard, undo steps, helpers, status, '
           'late results, clipboard, UI, file rotation, cleanup, bind errors')
 finally:
     first.unregister()

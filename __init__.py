@@ -7,7 +7,6 @@ import json
 import linecache
 import os
 import queue
-import secrets
 import shutil
 import subprocess
 import sys
@@ -67,7 +66,7 @@ def _get_timeout():
 
 def _url(server=None):
     server = server or _server
-    return f"http://127.0.0.1:{server.server_port}/{server.token}" if server else ""
+    return f"http://127.0.0.1:{server.server_port}" if server else ""
 
 
 def _console(message):
@@ -81,6 +80,35 @@ def _sync():
     _timeout = _get_timeout()
     _file = bpy.data.filepath
     _last_poll = time.monotonic()
+
+
+def _instructions(server=None):
+    """The agent instructions with this bridge's details filled in, or None if the file is missing.
+
+    Safe on HTTP threads: it reads only files and the values _sync() cached.
+    """
+    server = server or _server
+    folder = os.path.dirname(__file__)
+    try:
+        with open(os.path.join(folder, "agent_instructions.md"), "r", encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return None
+    try:
+        # Optional personal additions, not shipped with the add-on.
+        with open(os.path.join(folder, "agent_instructions.local.md"), "r", encoding="utf-8") as f:
+            text += "\n\n" + f.read()
+    except FileNotFoundError:
+        pass
+    for name, value in (
+        ("URL", _url(server)),
+        ("PORT", str(server.server_port)),
+        ("FILE", json.dumps(_file or "(unsaved)", ensure_ascii=False)),
+        ("TIMEOUT", f"{_timeout:g}"),
+        ("VERSION", _BLENDER),
+    ):
+        text = text.replace("{{" + name + "}}", value)
+    return text
 
 
 # --- Requests ---
@@ -329,7 +357,7 @@ def _ignore_disconnect(method):
 
 
 class _BridgeHandler(BaseHTTPRequestHandler):
-    """POST /<token> runs Python. GET /<token> reports status. GET /<token>/result/<id> waits for a request."""
+    """POST / runs Python. GET / explains the bridge, /status reports on it, /result/<id> waits for a request."""
 
     server_version = "BlenderBridge/1.2"
 
@@ -338,14 +366,14 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         raw = self._read_body()
         if raw is None:
             return
-        rest = self._authorize()
+        rest = self._route()
         if rest is None:
             return
         if rest:
-            self._refuse(404, "POST Python source to the bridge URL itself")
+            self._refuse(404, f"POST Python source to {_url(self.server)} itself; GET it for instructions")
             return
         if not raw:
-            self._refuse(400, "Request body is required")
+            self._refuse(400, f"Request body is required: POST Python source, or GET {_url(self.server)} for instructions")
             return
         try:
             code = raw.decode("utf-8")
@@ -353,7 +381,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             self._refuse(400, "Request body must be UTF-8")
             return
 
-        job = _Job(code.lstrip("﻿"))
+        job = _Job(code.lstrip("\ufeff"))
         with _queue_lock:
             if self.server is not _server:
                 self._refuse(503, "Bridge stopped; copy fresh instructions")
@@ -366,10 +394,17 @@ class _BridgeHandler(BaseHTTPRequestHandler):
 
     @_ignore_disconnect
     def do_GET(self):
-        rest = self._authorize()
+        rest = self._route()
         if rest is None:
             return
-        if not rest or rest == ["status"]:
+        if not rest:
+            # Lets a user point an agent at the port alone: the bridge explains itself.
+            text = _instructions(self.server)
+            if text is None:
+                self._refuse(500, "agent_instructions.md is missing from the add-on folder")
+            else:
+                self._send(200, text, "text/plain; charset=utf-8")
+        elif rest == ["status"]:
             self._send(200, json.dumps(_status()), "application/json")
         elif len(rest) == 2 and rest[0] == "result" and rest[1].isdigit():
             with _queue_lock:
@@ -379,7 +414,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             else:
                 self._reply(job)
         else:
-            self._refuse(404, "Unknown path")
+            self._refuse(404, f"Unknown path; GET {_url(self.server)} for instructions")
 
     def _read_body(self):
         """The raw request body, or None once a refusal has been sent."""
@@ -396,20 +431,15 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         # Read before any refusal, so the client gets the reply instead of a reset connection.
         return self.rfile.read(length)
 
-    def _authorize(self):
-        """Path segments after the session token, or None once a refusal has been sent."""
-        if self.headers.get("Origin"):
+    def _route(self):
+        """Path segments of the request, or None once a refusal has been sent."""
+        # Web pages must not reach the bridge. Browsers send Origin with every cross-site POST, and a page
+        # that rebinds its own domain to 127.0.0.1 still names that domain in Host.
+        host = self.headers.get("Host", "").rsplit(":", 1)[0].lower()
+        if self.headers.get("Origin") or host not in ("", "127.0.0.1", "localhost"):
             self._refuse(403, "Requests from web pages are not accepted")
             return None
-        parts = [part for part in self.path.split("?", 1)[0].split("/") if part]
-        token = getattr(self.server, "token", "")
-        if not parts or not secrets.compare_digest(parts[0].encode(), token.encode()):
-            self._refuse(403, (
-                "Missing or wrong session token. "
-                "Ctrl-click the bridge icon in Blender and paste the fresh instructions"
-            ))
-            return None
-        return parts[1:]
+        return [part for part in self.path.split("?", 1)[0].split("/") if part]
 
     def _format(self):
         accept = self.headers.get("Accept", "")
@@ -486,8 +516,6 @@ def _start_server():
                 raise
     else:
         raise OSError("No available Blender Bridge port")
-    # A fresh token per start: stale instructions and other local callers get a refusal.
-    server.token = secrets.token_urlsafe(9)
     _sync()
     _server = server
     _server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -644,32 +672,10 @@ class BRIDGE_OT_copy_instructions(bpy.types.Operator):
     def _copy(context):
         if not _active:
             return {'CANCELLED'}
-        port = _get_port()
-        addon_dir = os.path.dirname(__file__)
-
-        # Load global instructions (ships with addon)
-        global_path = os.path.join(addon_dir, "agent_instructions.md")
-        try:
-            with open(global_path, "r", encoding="utf-8") as f:
-                text = f.read()
-        except FileNotFoundError:
+        _sync()
+        text = _instructions()
+        if text is None:
             return {'CANCELLED'}
-
-        # Append local instructions if present
-        local_path = os.path.join(addon_dir, "agent_instructions.local.md")
-        try:
-            with open(local_path, "r", encoding="utf-8") as f:
-                text += "\n\n" + f.read()
-        except FileNotFoundError:
-            pass
-
-        text = text.replace("{{URL}}", _url())
-        text = text.replace("{{PORT}}", str(port))
-        text = text.replace("{{TOKEN}}", _server.token)
-        text = text.replace("{{FILE}}", json.dumps(bpy.data.filepath or "(unsaved)", ensure_ascii=False))
-        text = text.replace("{{TIMEOUT}}", f"{_get_timeout():g}")
-        text = text.replace("{{VERSION}}", _BLENDER)
-
         context.window_manager.clipboard = text
         return {'FINISHED'}
 
