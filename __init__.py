@@ -30,6 +30,8 @@ request_queue: queue.Queue = queue.Queue()  # of _Job
 _jobs: collections.OrderedDict = collections.OrderedDict()  # recent _Job by id, guarded by _queue_lock
 _sources: collections.deque = collections.deque()  # linecache names of recent requests
 _current = None  # the _Job Blender is executing right now
+_scene_updates = 0  # depsgraph updates seen, to tell edits from read-only requests
+_load_count = 0
 POLL_INTERVAL = 0.1
 DEFAULT_PORT = 9797  # Not 9876: the Blender MCP add-ons listen there by default.
 JOB_HISTORY = 16
@@ -39,6 +41,7 @@ _timeout = 60.0
 _file = ""
 _last_poll = 0.0
 _BLENDER = bpy.app.version_string
+_ID_COLLECTIONS = [p.identifier for p in bpy.types.BlendData.bl_rna.properties if p.type == 'COLLECTION']
 
 
 def _get_prefs():
@@ -178,6 +181,50 @@ def _format_error(exc):
     return text
 
 
+@persistent
+def _on_depsgraph_update(_scene, _depsgraph):
+    global _scene_updates
+    _scene_updates += 1
+
+
+def _scene_mark():
+    """A cheap fingerprint that moves when something the user could see or undo has changed."""
+    try:
+        bpy.context.view_layer.update()  # Deliver pending updates to _on_depsgraph_update now.
+        return _scene_updates, _load_count, sum(len(getattr(bpy.data, name)) for name in _ID_COLLECTIONS)
+    except Exception:
+        return None
+
+
+def _undo_label(job):
+    """The request's leading comment names its undo step."""
+    first = job.code.lstrip().split("\n", 1)[0].strip()
+    label = first.lstrip("#").strip()[:60] if first.startswith("#") and not first.startswith("#!") else ""
+    return f"Bridge: {label or f'request {job.id}'}"
+
+
+def _push_undo(job, before):
+    """Make a request's edits one undo step, so the user's undo reverts exactly that request."""
+    prefs = _get_prefs()
+    if not getattr(prefs, "undo", True):
+        return None
+    after = _scene_mark()
+    if before is not None and after == before:
+        return None  # Read-only: leave the user's undo history (32 steps by default) alone.
+    if before is not None and after is not None and before[1] != after[1]:
+        return None  # A file was loaded, which starts a new undo history.
+    if "ed.undo" in job.code or "ed.redo" in job.code:
+        return None  # The request drives undo itself.
+    label = _undo_label(job)
+    try:
+        window = bpy.context.window or bpy.context.window_manager.windows[0]
+        with bpy.context.temp_override(window=window):
+            bpy.ops.ed.undo_push(message=label)
+    except Exception:
+        return None
+    return label
+
+
 def _execute(job):
     global _current
     url_before = _url()
@@ -185,6 +232,7 @@ def _execute(job):
     out, err = _StreamWriter(job, "stdout"), _StreamWriter(job, "stderr")
     old_stdout, old_stderr = sys.stdout, sys.stderr
     error = None
+    before = _scene_mark()
     job.start()
     _current = job
     sys.stdout, sys.stderr = out, err
@@ -202,6 +250,9 @@ def _execute(job):
         err.flush()
         _current = None
     extra = {}
+    undo = _push_undo(job, before)
+    if undo:
+        extra["undo"] = undo
     if _server is not None and _url() != url_before:
         extra["url"] = _url()
     job.finish(error is None, error, **extra)
@@ -495,7 +546,8 @@ def _load_pre(_filepath):
 
 @persistent
 def _load_post(_filepath):
-    global _restart_after_load
+    global _restart_after_load, _load_count
+    _load_count += 1
     if _restart_after_load:
         _restart_after_load = False
         try:
@@ -652,6 +704,12 @@ class BridgePreferences(bpy.types.AddonPreferences):
         ),
     )
 
+    undo: bpy.props.BoolProperty(
+        name="Undo Step per Request",
+        default=True,
+        description="After a request that changes the scene, add an undo step so that Ctrl+Z reverts that request",
+    )
+
     def draw(self, context):
         layout = self.layout
         row = layout.row()
@@ -659,6 +717,7 @@ class BridgePreferences(bpy.types.AddonPreferences):
         row.prop(self, "timeout")
         if _active:
             row.label(text="(restart bridge to apply port changes)")
+        layout.prop(self, "undo")
         layout.operator("bridge.copy_instructions", icon='COPYDOWN')
 
 
@@ -688,6 +747,7 @@ def register():
     bpy.app.handlers.load_pre.append(_load_pre)
     bpy.app.handlers.load_post.append(_load_post)
     bpy.app.handlers.load_post_fail.append(_load_post)
+    bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
 
 
 def unregister():
@@ -700,6 +760,7 @@ def unregister():
     bpy.app.handlers.load_pre.remove(_load_pre)
     bpy.app.handlers.load_post.remove(_load_post)
     bpy.app.handlers.load_post_fail.remove(_load_post)
+    bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
     bpy.types.TOPBAR_HT_upper_bar.remove(_draw_topbar)
     bpy.utils.unregister_class(BridgePreferences)
     bpy.utils.unregister_class(BRIDGE_OT_copy_instructions)

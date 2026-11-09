@@ -106,6 +106,17 @@ try:
     assert lines[0] == {'channel': 'stdout', 'data': 'stream\n'}
     assert lines[-1] == {'channel': 'result', 'ok': True, 'id': lines[-1]['id'], 'state': 'done'}
 
+    # Only requests that change the scene become undo steps, named by their leading comment.
+    assert 'undo' not in ask(first, 'print(len(bpy.data.objects), bpy.context.scene.frame_current)')[1]
+    assert ask(first, '# nudge the cube\nbpy.data.objects["Cube"].location.x += 1')[1]['undo'] == 'Bridge: nudge the cube'
+    status, reply = ask(first, 'bpy.data.meshes.new("spare")')
+    assert reply['undo'] == f"Bridge: request {reply['id']}", reply
+    assert ask(first, 'bpy.context.scene.render.resolution_x += 2\nraise ValueError("half done")')[1]['undo']
+    assert 'undo' not in ask(first, 'bpy.data.objects["Cube"].location.x += 1; bpy.ops.ed.undo_push(message="mine")')[1]
+    prefs.undo = False
+    assert 'undo' not in ask(first, 'bpy.data.objects["Cube"].location.x += 1')[1]
+    del prefs.undo
+
     # Only the copied URL works: no token, another session's token and web pages are refused, unrun.
     base = f'http://127.0.0.1:{first._get_port()}'
     marker = 'import bpy; bpy.app.driver_namespace["bridge_test_ran"] = True'
@@ -173,7 +184,7 @@ try:
     assert first._get_port() != previous_port
     assert (status, body) == (200, f'[bridge] A file was loaded; this Blender now answers at {first._url()}\n'), body
     status, reply = ask(first, 'bpy.ops.wm.read_homefile(use_empty=True)')
-    assert status == 200 and reply['url'] == first._url()
+    assert status == 200 and reply['url'] == first._url() and 'undo' not in reply
 
     pending = first._Job('raise AssertionError("must not run")')
     first.request_queue.put(pending)
@@ -190,8 +201,8 @@ try:
         else:
             raise AssertionError('Expected permission error')
     assert first._server is None and not first._active
-    print('PASS: ports, tokens, text/JSON/streaming replies, errors, exit guard, status, late results, '
-          'clipboard, UI, file rotation, cleanup, bind errors')
+    print('PASS: ports, tokens, text/JSON/streaming replies, errors, exit guard, undo steps, status, '
+          'late results, clipboard, UI, file rotation, cleanup, bind errors')
 finally:
     first.unregister()
     second._stop_server()

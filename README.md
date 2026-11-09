@@ -72,6 +72,12 @@ Send `Accept: application/json` for one JSON object instead (`ok`, `id`, `state`
 
 Each request runs as `__main__` in a fresh namespace with `bpy` imported. Tracebacks show the request's own source lines. `sys.exit()` ends the request, not Blender.
 
+## Undo
+
+A request that changes the scene becomes one undo step, so **Ctrl+Z** takes back exactly what the agent just did and **Ctrl+Shift+Z** brings it back. The step is named after the request's first comment line, for example `Bridge: add table legs`, and shows up in **Edit > Undo History**. Read-only requests add no step, so they do not use up your undo history.
+
+Without this, edits made from a script are not undo steps at all: your next undo would remove them together with your own last action, and redo would not restore them.
+
 ## Visual feedback
 
 When a visual check is necessary or helpful, use the fastest suitable method: a viewport screenshot for quick checks, a viewport render for a clean preview, or an engine render for final appearance. Prefer inspecting scene data to analyze progress unless visual verification is directly applicable.
@@ -105,6 +111,7 @@ In **Edit > Preferences > Add-ons > Blender Bridge**:
 | Setting | Default | Description |
 |---|---|---|
 | Port | `9797` | Preferred starting port; skips occupied ports (restart to apply) |
+| Undo Step per Request | on | Adds an undo step after each request that changes the scene. Turn it off if undo steps are slow in a very heavy file |
 | Timeout | `60s` | How long a reply waits. Slower requests keep running and can be collected with `GET <url>/result/<id>` |
 
 ## Limitations
