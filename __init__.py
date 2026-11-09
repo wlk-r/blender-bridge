@@ -18,6 +18,8 @@ from bpy.app.handlers import persistent
 from itertools import chain, count
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import helpers
+
 _server: ThreadingHTTPServer | None = None
 _server_thread: threading.Thread | None = None
 _active = False
@@ -237,7 +239,7 @@ def _execute(job):
     _current = job
     sys.stdout, sys.stderr = out, err
     try:
-        namespace = {"__name__": "__main__", "__builtins__": __builtins__, "bpy": bpy}
+        namespace = {"__name__": "__main__", "__builtins__": __builtins__, "bpy": bpy, "bridge": helpers}
         exec(compile(job.code, name, "exec"), namespace)
     except SystemExit as exc:  # Must not take Blender down; a zero status is a normal end of script.
         if exc.code not in (0, None):

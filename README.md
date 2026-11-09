@@ -70,7 +70,7 @@ The reply to a request is plain text: whatever the script printed, then the trac
 
 Send `Accept: application/json` for one JSON object instead (`ok`, `id`, `state`, `stdout`, `stderr`, and `error` on failure), or `Accept: application/x-ndjson` to stream output while the script runs: one JSON line per printed line (`channel`, `data`), then a final `result` line.
 
-Each request runs as `__main__` in a fresh namespace with `bpy` imported. Tracebacks show the request's own source lines. `sys.exit()` ends the request, not Blender.
+Each request runs as `__main__` in a fresh namespace with `bpy` and the `bridge` helpers. Tracebacks show the request's own source lines. `sys.exit()` ends the request, not Blender.
 
 ## Undo
 
@@ -80,29 +80,17 @@ Without this, edits made from a script are not undo steps at all: your next undo
 
 ## Visual feedback
 
-When a visual check is necessary or helpful, use the fastest suitable method: a viewport screenshot for quick checks, a viewport render for a clean preview, or an engine render for final appearance. Prefer inspecting scene data to analyze progress unless visual verification is directly applicable.
+Requests get a `bridge` helper for looking at the scene. Its image functions save a PNG, return the path, and leave the scene, your viewport and the undo history untouched. The agent then opens the file with its own image tool.
 
-For a viewport render, the example below uses `render.opengl` with an explicit small resolution. The agent then reads the PNG with its own file tool.
+| Helper | What it does |
+|---|---|
+| `bridge.look(objects)` | Saves one labelled image of the objects from the front, right, top and a perspective angle, each framed to fit. Geometry in front of and behind the objects is clipped away, so a room's walls do not hide what is inside. Takes objects or names; defaults to everything visible |
+| `bridge.view()` | Saves what your 3D viewport shows now, at up to 960 px |
+| `bridge.override('VIEW_3D')` | A context for operators that need an editor, since requests run without one: `with bridge.override(): bpy.ops.view3d.view_selected()` |
 
-```python
-import bpy, os, tempfile
-path = os.path.join(tempfile.gettempdir(), "bridge_view.png")
-win = bpy.context.window_manager.windows[0]
-area = next(a for a in win.screen.areas if a.type == 'VIEW_3D')
-region = next(r for r in area.regions if r.type == 'WINDOW')
-r = bpy.context.scene.render
-saved = (r.resolution_x, r.resolution_y, r.resolution_percentage, r.filepath, r.image_settings.file_format)
-r.resolution_x, r.resolution_y, r.resolution_percentage = 960, 540, 100
-r.image_settings.file_format, r.filepath = 'PNG', path
-try:
-    with bpy.context.temp_override(window=win, area=area, region=region):
-        bpy.ops.render.opengl(write_still=True, view_context=True)
-finally:
-    r.resolution_x, r.resolution_y, r.resolution_percentage, r.filepath, r.image_settings.file_format = saved
-print(path)
-```
+`bridge.look("Chair", views=("front", "left"), size=512)` picks the directions and the tile size. Images are drawn offscreen in the viewport's current shading mode, so they need Blender's window.
 
-`view_context=True` renders what the viewport currently shows. Set it to `False` to render from the scene camera instead. Image cost scales with pixel area, so lower the resolution for quick sanity checks.
+The agent instructions ask agents to use scene data for facts and an image for judgments, and to look at milestones rather than after every edit.
 
 ## Settings
 

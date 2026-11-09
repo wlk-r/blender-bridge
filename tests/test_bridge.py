@@ -13,6 +13,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import bpy
+from mathutils import Vector
 
 ROOT = Path(__file__).resolve().parents[1]
 JSON = 'application/json'
@@ -117,6 +118,17 @@ try:
     assert 'undo' not in ask(first, 'bpy.data.objects["Cube"].location.x += 1')[1]
     del prefs.undo
 
+    # Helpers: every point must be in frame from every direction; drawing needs Blender's window.
+    assert request(first, 'print(sorted(bridge.__all__))') == (200, "['look', 'override', 'view']\n")
+    points = [Vector(p) for p in ((0, 0, 0), (4, 1, 0.5), (-1, 3, 2), (2, -2, 6))]
+    for view in first.helpers.VIEWS:
+        view_matrix, projection = first.helpers._frame(points, view)
+        for point in points:
+            clip = projection @ view_matrix @ point.to_4d()
+            assert all(abs(c / clip.w) <= 1.0 for c in clip.xyz), (view, point)
+    status, body = request(first, 'print(bridge.look())')
+    assert status == 500 and "need Blender's window" in body, body
+
     # Only the copied URL works: no token, another session's token and web pages are refused, unrun.
     base = f'http://127.0.0.1:{first._get_port()}'
     marker = 'import bpy; bpy.app.driver_namespace["bridge_test_ran"] = True'
@@ -201,7 +213,7 @@ try:
         else:
             raise AssertionError('Expected permission error')
     assert first._server is None and not first._active
-    print('PASS: ports, tokens, text/JSON/streaming replies, errors, exit guard, undo steps, status, '
+    print('PASS: ports, tokens, text/JSON/streaming replies, errors, exit guard, undo steps, helpers, status, '
           'late results, clipboard, UI, file rotation, cleanup, bind errors')
 finally:
     first.unregister()

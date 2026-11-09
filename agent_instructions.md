@@ -13,10 +13,10 @@ Confirm the file is the one you expect before editing. If you have no task yet, 
 ## Sending code
 - For anything longer than one line, pipe a quoted heredoc so the shell cannot alter the code: `curl -sS --noproxy '*' {{URL}} --data-binary @- <<'PY'`, then the script, then `PY`. Keep a script you will revise in a file and send it with `--data-binary @script.py`.
 - The reply is plain text: whatever the script printed, followed by the traceback if it failed. The HTTP status is 200 on success and 500 on a Python error; add `--fail-with-body` if you want curl's exit code to show it. Lines starting with `[bridge]` come from the bridge, not from your script. For one JSON object instead (`ok`, `stdout`, `stderr`, `error`), add `-H 'Accept: application/json'`.
-- Each request runs as `__main__` in a fresh namespace holding only `bpy`. Scene changes persist; variables, functions and imports do not.
+- Each request runs as `__main__` in a fresh namespace holding `bpy` and the `bridge` helpers. Scene changes persist; variables, functions and imports do not.
 
 ## How code runs here
-- Code runs from a timer, not from an editor. `bpy.context.window`, `scene`, `view_layer`, `active_object` and `selected_objects` work, but `area` and `region` are `None`, so operators that need a viewport or editor must run inside `bpy.context.temp_override(window=..., area=..., region=...)`. The snippet under "Seeing your work" shows the pattern.
+- Code runs from a timer, not from an editor. `bpy.context.window`, `scene`, `view_layer`, `active_object` and `selected_objects` work, but `area` and `region` are `None`. Run operators that need a viewport or editor inside `with bridge.override('VIEW_3D'):`.
 - Prefer the data API and `bmesh` for edits: they do not depend on selection or editor context. Check `bpy.context.mode` first. While an object is in Edit Mode its mesh data is stale and direct changes to it are discarded on exit, so use `bmesh.from_edit_mesh`, or leave Edit Mode and return to it afterwards.
 - Each request that changes the scene becomes one undo step, so the user's Ctrl+Z takes back exactly that request. Make a request one coherent change and begin it with a comment line saying what it does: that line names the undo step. To take back your own last change, send `bpy.ops.ed.undo()`.
 - Your memory of the API may come from another Blender version, so ask the live session instead of guessing: `dir(x)`, `x.__doc__`, `[p.identifier for p in x.bl_rna.properties]` for data-block fields, `bpy.ops.a.b.get_rna_type().properties.keys()` for operator arguments. Print only the slice you need; `help()` output is large.
@@ -25,25 +25,10 @@ Confirm the file is the one you expect before editing. If you have no task yet, 
 ## Seeing your work
 Use scene data for facts (names, counts, dimensions, transforms, modifiers) and an image for judgments (shape, proportion, shading, materials, composition). When a task changes how something looks, check an image at each milestone and before you report it done, from more than one angle for anything three-dimensional. Do not render after every edit.
 
-This saves what the user's 3D viewport currently shows. Open the PNG with your image tool.
-```python
-import bpy, os, tempfile
-path = os.path.join(tempfile.gettempdir(), "bridge_view.png")
-win = bpy.context.window_manager.windows[0]
-area = next(a for a in win.screen.areas if a.type == 'VIEW_3D')
-region = next(r for r in area.regions if r.type == 'WINDOW')
-r = bpy.context.scene.render
-saved = (r.resolution_x, r.resolution_y, r.resolution_percentage, r.filepath, r.image_settings.file_format)
-r.resolution_x, r.resolution_y, r.resolution_percentage = 960, 540, 100
-r.image_settings.file_format, r.filepath = 'PNG', path
-try:
-    with bpy.context.temp_override(window=win, area=area, region=region):
-        bpy.ops.render.opengl(write_still=True, view_context=True)
-finally:
-    r.resolution_x, r.resolution_y, r.resolution_percentage, r.filepath, r.image_settings.file_format = saved
-print(path)
-```
-`view_context=False` renders through `scene.camera` instead. To see another angle without moving the user's view, point a temporary camera there, render, then restore `scene.camera` and remove the temporary one. Avoid `bpy.ops.screen.screenshot` and `screenshot_area`: they save at full window resolution. For final appearance use `bpy.ops.render.render(write_still=True)` with a reduced `resolution_percentage`.
+- `bridge.look(objects)` saves one labelled image of those objects from the front, right, top and a perspective angle, each framed to fit, without moving the user's view. Pass objects or names; with no argument it frames everything visible. Walls in front of the objects are clipped away.
+- `bridge.view()` saves what the user's 3D viewport shows now.
+- Both return the PNG path: print it, then open the file with your image tool. `print(bridge.__doc__)` lists the options.
+- For final appearance use `bpy.ops.render.render(write_still=True)` with a reduced `resolution_percentage`.
 
 ## Working with the user
 - Their selection, active object, 3D cursor and mode are part of the request: "this" means whatever is selected. Leave selection, mode, current frame and viewport as you found them unless changing them is the task.
