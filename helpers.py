@@ -4,10 +4,11 @@ bridge.view(path=None, size=960)
     Save what the user's 3D viewport shows now. Returns the PNG path.
 
 bridge.look(objects=None, views=("front", "right", "top", "persp"), size=384, path=None)
-    Save one labelled image of the objects seen from standard directions, each framed
-    to fit, without moving the user's view. `objects` takes objects or names and
-    defaults to all visible geometry. Geometry in front of and behind the objects is
-    clipped away, so walls do not hide them. Other views: "back", "left", "bottom".
+    Save one labelled image of the objects seen from standard directions, framed to
+    fit, without moving the user's view. The orthographic views share one scale, so
+    proportions compare across them. `objects` takes objects or names and defaults to
+    all visible geometry. Geometry in front of and behind the objects is clipped away,
+    so walls do not hide them. Other views: "back", "left", "bottom".
     Returns the PNG path.
 
 bridge.override(area_type='VIEW_3D')
@@ -84,17 +85,26 @@ def _points(objects):
     return points
 
 
-def _frame(points, view):
-    """View and projection matrices that fit the points from a named direction."""
+def _camera_space(points, view):
+    """(center, rotation, points relative to both): x right, y up, z towards the camera."""
     if view not in VIEWS:
         raise ValueError(f"Unknown view {view!r}; choose from {', '.join(VIEWS)}")
     low = Vector(min(p[i] for p in points) for i in range(3))
     high = Vector(max(p[i] for p in points) for i in range(3))
     center = (low + high) / 2
-    radius = max(max((p - center).length for p in points), 0.01)
     rotation = Euler([math.radians(angle) for angle in VIEWS[view]]).to_matrix()
-    local = [rotation.inverted() @ (p - center) for p in points]  # x right, y up, z towards the camera
-    half = max(max(abs(p.x), abs(p.y)) for p in local)
+    return center, rotation, [rotation.inverted() @ (p - center) for p in points]
+
+
+def _half_extent(points, view):
+    return max(max(abs(p.x), abs(p.y)) for p in _camera_space(points, view)[2])
+
+
+def _frame(points, view, half=None):
+    """View and projection matrices that fit the points from a named direction."""
+    center, rotation, local = _camera_space(points, view)
+    radius = max(max(p.length for p in local), 0.01)
+    half = half or _half_extent(points, view)
     front, back = max(p.z for p in local), min(p.z for p in local)
     pad = radius * 0.05
     if view == "persp":
@@ -194,7 +204,9 @@ def look(objects=None, views=("front", "right", "top", "persp"), size=384, path=
 
     views = [views] if isinstance(views, str) else list(views)
     points = _points(objects)
-    tiles = _draw([(*_frame(points, name), name) for name in views], size, size)
+    flat = [name for name in views if name != "persp"]
+    half = max((_half_extent(points, name) for name in flat), default=None)  # One scale for all flat views.
+    tiles = _draw([(*_frame(points, name, half), name) for name in views], size, size)
     columns = 1 if len(tiles) == 1 else 2 if len(tiles) <= 4 else 3
     rows = math.ceil(len(tiles) / columns)
     gap = 2

@@ -207,9 +207,6 @@ def _undo_label(job):
 
 def _push_undo(job, before):
     """Make a request's edits one undo step, so the user's undo reverts exactly that request."""
-    prefs = _get_prefs()
-    if not getattr(prefs, "undo", True):
-        return None
     after = _scene_mark()
     if before is not None and after == before:
         return None  # Read-only: leave the user's undo history (32 steps by default) alone.
@@ -234,7 +231,8 @@ def _execute(job):
     out, err = _StreamWriter(job, "stdout"), _StreamWriter(job, "stderr")
     old_stdout, old_stderr = sys.stdout, sys.stderr
     error = None
-    before = _scene_mark()
+    track_undo = getattr(_get_prefs(), "undo", True)
+    before = _scene_mark() if track_undo else None
     job.start()
     _current = job
     sys.stdout, sys.stderr = out, err
@@ -252,12 +250,14 @@ def _execute(job):
         err.flush()
         _current = None
     extra = {}
-    undo = _push_undo(job, before)
-    if undo:
-        extra["undo"] = undo
-    if _server is not None and _url() != url_before:
-        extra["url"] = _url()
-    job.finish(error is None, error, **extra)
+    try:
+        undo = _push_undo(job, before) if track_undo else None
+        if undo:
+            extra["undo"] = undo
+        if _server is not None and _url() != url_before:
+            extra["url"] = _url()
+    finally:
+        job.finish(error is None, error, **extra)  # Whatever happens above, the caller gets its reply.
 
 
 def _describe(job, url):

@@ -121,11 +121,13 @@ try:
     # Helpers: every point must be in frame from every direction; drawing needs Blender's window.
     assert request(first, 'print(sorted(bridge.__all__))') == (200, "['look', 'override', 'view']\n")
     points = [Vector(p) for p in ((0, 0, 0), (4, 1, 0.5), (-1, 3, 2), (2, -2, 6))]
+    shared = max(first.helpers._half_extent(points, view) for view in first.helpers.VIEWS)
     for view in first.helpers.VIEWS:
-        view_matrix, projection = first.helpers._frame(points, view)
-        for point in points:
-            clip = projection @ view_matrix @ point.to_4d()
-            assert all(abs(c / clip.w) <= 1.0 for c in clip.xyz), (view, point)
+        for half in (None, shared):
+            view_matrix, projection = first.helpers._frame(points, view, half)
+            for point in points:
+                clip = projection @ view_matrix @ point.to_4d()
+                assert all(abs(c / clip.w) <= 1.0 for c in clip.xyz), (view, half, point)
     status, body = request(first, 'print(bridge.look())')
     assert status == 500 and "need Blender's window" in body, body
 

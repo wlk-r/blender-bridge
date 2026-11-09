@@ -11,6 +11,9 @@ blender_version_min = "4.2.0"
 
 license = ["SPDX:MIT"]
 
+[permissions]
+network = "Runs a local HTTP server for coding agents"
+
 [build]
 paths_exclude_pattern = [
     ".git/",

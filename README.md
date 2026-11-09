@@ -51,6 +51,8 @@ The addon ships with two instruction files that get copied to the agent's contex
 | `agent_instructions.md` | Global instructions shared with every agent. Covers the HTTP protocol, safety rules, tips, and gotchas. Edit with care — changes affect all agents. |
 | `agent_instructions.local.md` | Optional. Your personal preferences, project-specific prompts, or extra context. Create this file in the addon folder to append to the global instructions. Not tracked by git. |
 
+Both files can use the placeholders `{{URL}}`, `{{PORT}}`, `{{TOKEN}}`, `{{FILE}}`, `{{TIMEOUT}}` and `{{VERSION}}` (the Blender version), which are filled in when you copy.
+
 ## Protocol
 
 | Request | What it does |
@@ -68,7 +70,7 @@ The reply to a request is plain text: whatever the script printed, then the trac
 | `504` | The script is still running or queued after the timeout. It was not cancelled; the reply has the output so far and the id to collect it with |
 | `403` | Missing or wrong token, or the request came from a web page |
 
-Send `Accept: application/json` for one JSON object instead (`ok`, `id`, `state`, `stdout`, `stderr`, and `error` on failure), or `Accept: application/x-ndjson` to stream output while the script runs: one JSON line per printed line (`channel`, `data`), then a final `result` line.
+Send `Accept: application/json` for one JSON object instead (`ok`, `id`, `state`, `stdout`, `stderr`, `error` on failure, `undo` when the request became an undo step, `url` when a file load moved the bridge), or `Accept: application/x-ndjson` to stream output while the script runs: one JSON line per printed line (`channel`, `data`), then a final `result` line.
 
 Each request runs as `__main__` in a fresh namespace with `bpy` and the `bridge` helpers. Tracebacks show the request's own source lines. `sys.exit()` ends the request, not Blender.
 
@@ -84,7 +86,7 @@ Requests get a `bridge` helper for looking at the scene. Its image functions sav
 
 | Helper | What it does |
 |---|---|
-| `bridge.look(objects)` | Saves one labelled image of the objects from the front, right, top and a perspective angle, each framed to fit. Geometry in front of and behind the objects is clipped away, so a room's walls do not hide what is inside. Takes objects or names; defaults to everything visible |
+| `bridge.look(objects)` | Saves one labelled image of the objects from the front, right, top and a perspective angle, framed to fit; the flat views share one scale so proportions compare. Geometry in front of and behind the objects is clipped away, so a room's walls do not hide what is inside. Takes objects or names; defaults to everything visible |
 | `bridge.view()` | Saves what your 3D viewport shows now, at up to 960 px |
 | `bridge.override('VIEW_3D')` | A context for operators that need an editor, since requests run without one: `with bridge.override(): bpy.ops.view3d.view_selected()` |
 

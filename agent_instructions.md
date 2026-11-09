@@ -25,7 +25,7 @@ Confirm the file is the one you expect before editing. If you have no task yet, 
 ## Seeing your work
 Use scene data for facts (names, counts, dimensions, transforms, modifiers) and an image for judgments (shape, proportion, shading, materials, composition). When a task changes how something looks, check an image at each milestone and before you report it done, from more than one angle for anything three-dimensional. Do not render after every edit.
 
-- `bridge.look(objects)` saves one labelled image of those objects from the front, right, top and a perspective angle, each framed to fit, without moving the user's view. Pass objects or names; with no argument it frames everything visible. Walls in front of the objects are clipped away.
+- `bridge.look(objects)` saves one labelled image of those objects from the front, right, top and a perspective angle, framed to fit, without moving the user's view. Pass objects or names; with no argument it frames everything visible. Walls in front of the objects are clipped away.
 - `bridge.view()` saves what the user's 3D viewport shows now.
 - Both return the PNG path: print it, then open the file with your image tool. `print(bridge.__doc__)` lists the options.
 - For final appearance use `bpy.ops.render.render(write_still=True)` with a reduced `resolution_percentage`.
