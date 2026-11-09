@@ -1,9 +1,13 @@
 import bpy
 import bpy.utils.previews
+import collections
 import errno
+import io
 import json
+import linecache
 import os
 import queue
+import secrets
 import shutil
 import subprocess
 import sys
@@ -21,10 +25,20 @@ _restart_after_load = False
 _retired_ports = set()
 _queue_lock = threading.Lock()
 _icon_collection = None
-_request_ids = count(1)
-request_queue: queue.Queue[tuple[int, str, queue.Queue]] = queue.Queue()
+_job_ids = count(1)
+request_queue: queue.Queue = queue.Queue()  # of _Job
+_jobs: collections.OrderedDict = collections.OrderedDict()  # recent _Job by id, guarded by _queue_lock
+_sources: collections.deque = collections.deque()  # linecache names of recent requests
+_current = None  # the _Job Blender is executing right now
 POLL_INTERVAL = 0.1
-_STREAM_DONE = "done"
+DEFAULT_PORT = 9797  # Not 9876: the Blender MCP add-ons listen there by default.
+JOB_HISTORY = 16
+MAX_BODY = 64 * 1024 * 1024
+# Written on Blender's main thread and only read by HTTP threads, which must not touch bpy.
+_timeout = 60.0
+_file = ""
+_last_poll = 0.0
+_BLENDER = bpy.app.version_string
 
 
 def _get_prefs():
@@ -38,7 +52,7 @@ def _get_port():
     if _server is not None:
         return _server.server_port
     prefs = _get_prefs()
-    return prefs.port if prefs else 9876
+    return prefs.port if prefs else DEFAULT_PORT
 
 
 def _get_timeout():
@@ -46,196 +60,389 @@ def _get_timeout():
     return prefs.timeout if prefs else 60.0
 
 
-def _clear_queue(q):
-    while True:
-        try:
-            q.get_nowait()
-        except queue.Empty:
-            return
+def _url(server=None):
+    server = server or _server
+    return f"http://127.0.0.1:{server.server_port}/{server.token}" if server else ""
 
 
-class _StreamWriter:
-    """File-like that pushes each write() into a queue for real-time streaming."""
+def _console(message):
+    # The real console, not a request's captured output.
+    print(message, file=sys.__stdout__, flush=True)
 
-    def __init__(self, stream_queue, channel):
-        self._q = stream_queue
-        self._ch = channel
+
+def _sync():
+    """Refresh what HTTP threads are allowed to read. Runs on Blender's main thread."""
+    global _timeout, _file, _last_poll
+    _timeout = _get_timeout()
+    _file = bpy.data.filepath
+    _last_poll = time.monotonic()
+
+
+# --- Requests ---
+
+class _Job:
+    """One posted script: its output so far and, once finished, its result."""
+
+    def __init__(self, code):
+        self.id = next(_job_ids)
+        self.code = code
+        self.chunks = []  # (channel, text) in arrival order
+        self.state = "queued"  # queued -> running -> done
+        self.result = {}
+        self.created = time.monotonic()
+        self.started = self.created
+        self._changed = threading.Condition()
+
+    def write(self, channel, text):
+        with self._changed:
+            self.chunks.append((channel, text))
+            self._changed.notify_all()
+
+    def start(self):
+        with self._changed:
+            self.state = "running"
+            self.started = time.monotonic()
+
+    def finish(self, ok, error=None, **extra):
+        with self._changed:
+            self.result = {"ok": ok, **extra}
+            if error:
+                self.result["error"] = error
+            self.state = "done"
+            self._changed.notify_all()
+
+    def follow(self, deadline):
+        """Yield output chunks as they arrive, until the job is done or the deadline passes."""
+        sent = 0
+        while True:
+            with self._changed:
+                while sent == len(self.chunks) and self.state != "done":
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    self._changed.wait(remaining)
+                fresh = self.chunks[sent:]
+                sent += len(fresh)
+                done = self.state == "done"
+            yield from fresh
+            if done:
+                return
+
+    def snapshot(self):
+        with self._changed:
+            return self.state, list(self.chunks), dict(self.result)
+
+
+class _StreamWriter(io.TextIOBase):
+    """Stands in for sys.stdout/sys.stderr during a request and forwards whole lines to its job."""
+
+    encoding = "utf-8"
+
+    def __init__(self, job, channel):
+        self._job = job
+        self._channel = channel
+        self._partial = ""
+
+    def writable(self):
+        return True
 
     def write(self, text):
-        if text:
-            self._q.put((self._ch, text))
-        return len(text) if text else 0
+        self._partial += text
+        if "\n" in self._partial:
+            lines, _, self._partial = self._partial.rpartition("\n")
+            self._job.write(self._channel, lines + "\n")
+        return len(text)
 
     def flush(self):
-        pass
+        if self._partial:
+            self._job.write(self._channel, self._partial)
+            self._partial = ""
 
 
-def _execute_code(code, stream_q):
+def _remember_source(job):
+    """Let tracebacks show the request's own source lines."""
+    name = f"<bridge-{job.id}>"
+    linecache.cache[name] = (len(job.code), None, job.code.splitlines(True), name)
+    _sources.append(name)
+    while len(_sources) > JOB_HISTORY:
+        linecache.cache.pop(_sources.popleft(), None)
+    return name
+
+
+def _format_error(exc):
+    # Skip this module's own frame so the traceback starts in the request's code.
+    tb = exc.__traceback__.tb_next if exc.__traceback__ else None
+    text = "".join(traceback.format_exception(type(exc), exc, tb))
+    if isinstance(exc, SystemExit):
+        text += "sys.exit() ends only this request: Blender stays open.\n"
+    return text
+
+
+def _execute(job):
+    global _current
+    url_before = _url()
+    name = _remember_source(job)
+    out, err = _StreamWriter(job, "stdout"), _StreamWriter(job, "stderr")
     old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout = _StreamWriter(stream_q, "stdout")
-    sys.stderr = _StreamWriter(stream_q, "stderr")
+    error = None
+    job.start()
+    _current = job
+    sys.stdout, sys.stderr = out, err
     try:
-        exec(code, {"__builtins__": __builtins__, "bpy": bpy})
-        stream_q.put((_STREAM_DONE, {"ok": True}))
-    except Exception:
-        stream_q.put((_STREAM_DONE, {"ok": False, "error": traceback.format_exc()}))
+        namespace = {"__name__": "__main__", "__builtins__": __builtins__, "bpy": bpy}
+        exec(compile(job.code, name, "exec"), namespace)
+    except SystemExit as exc:  # Must not take Blender down; a zero status is a normal end of script.
+        if exc.code not in (0, None):
+            error = _format_error(exc)
+    except BaseException as exc:  # KeyboardInterrupt included, for the same reason.
+        error = _format_error(exc)
     finally:
         sys.stdout, sys.stderr = old_stdout, old_stderr
+        out.flush()
+        err.flush()
+        _current = None
+    extra = {}
+    if _server is not None and _url() != url_before:
+        extra["url"] = _url()
+    job.finish(error is None, error, **extra)
+
+
+def _describe(job, url):
+    """Reply payload for a job (its result, or where it stands) plus its output in arrival order."""
+    state, chunks, result = job.snapshot()
+    reply = {
+        "ok": False,
+        "id": job.id,
+        "state": state,
+        "stdout": "".join(text for channel, text in chunks if channel == "stdout"),
+        "stderr": "".join(text for channel, text in chunks if channel == "stderr"),
+    }
+    if state == "done":
+        reply.update(result)
+    else:
+        waited = time.monotonic() - job.created
+        if state == "running":
+            where = f"is still running after {waited:.0f}s"
+        else:
+            where = f"has waited {waited:.0f}s without starting because Blender is busy"
+        reply["error"] = (
+            f"Request {job.id} {where}. It was not cancelled, so do not send it again. "
+            f"Collect its result with a GET to {url}/result/{job.id}"
+        )
+    return reply, "".join(text for _, text in chunks)
+
+
+def _end_line(text):
+    return text if not text or text.endswith("\n") else text + "\n"
+
+
+def _as_text(reply, output):
+    """Plain-text reply: what the script printed, then anything the bridge has to add."""
+    text = output
+    notes = []
+    if reply["state"] != "done":
+        notes.append(reply["error"])
+    else:
+        if not reply["ok"]:
+            text = _end_line(text) + _end_line(reply["error"])
+        if reply.get("url"):
+            notes.append(f"A file was loaded; this Blender now answers at {reply['url']}")
+    if notes:
+        return _end_line(text) + "".join(f"[bridge] {note}\n" for note in notes)
+    return text or "[bridge] ok (no output)\n"
+
+
+def _status():
+    now = time.monotonic()
+    current = _current
+    return {
+        "ok": True,
+        "blender": _BLENDER,
+        "file": _file,
+        "busy": current is not None or not request_queue.empty() or now - _last_poll > 1.0,
+        "running": {"id": current.id, "seconds": round(now - current.started, 1)} if current else None,
+        "queued": request_queue.qsize(),
+        "timeout": _timeout,
+    }
+
+
+def _ignore_disconnect(method):
+    def wrapper(self):
+        try:
+            method(self)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+    return wrapper
 
 
 class _BridgeHandler(BaseHTTPRequestHandler):
+    """POST /<token> runs Python. GET /<token> reports status. GET /<token>/result/<id> waits for a request."""
+
     server_version = "BlenderBridge/1.2"
 
+    @_ignore_disconnect
     def do_POST(self):
+        raw = self._read_body()
+        if raw is None:
+            return
+        rest = self._authorize()
+        if rest is None:
+            return
+        if rest:
+            self._refuse(404, "POST Python source to the bridge URL itself")
+            return
+        if not raw:
+            self._refuse(400, "Request body is required")
+            return
+        try:
+            code = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            self._refuse(400, "Request body must be UTF-8")
+            return
+
+        job = _Job(code.lstrip("﻿"))
+        with _queue_lock:
+            if self.server is not _server:
+                self._refuse(503, "Bridge stopped; copy fresh instructions")
+                return
+            _jobs[job.id] = job
+            for old in [i for i, j in _jobs.items() if j.state == "done"][:-JOB_HISTORY]:
+                del _jobs[old]
+            request_queue.put(job)
+        self._reply(job)
+
+    @_ignore_disconnect
+    def do_GET(self):
+        rest = self._authorize()
+        if rest is None:
+            return
+        if not rest or rest == ["status"]:
+            self._send(200, json.dumps(_status()), "application/json")
+        elif len(rest) == 2 and rest[0] == "result" and rest[1].isdigit():
+            with _queue_lock:
+                job = _jobs.get(int(rest[1]))
+            if job is None:
+                self._refuse(404, f"No request {rest[1]} in this bridge session (the last {JOB_HISTORY} are kept)")
+            else:
+                self._reply(job)
+        else:
+            self._refuse(404, "Unknown path")
+
+    def _read_body(self):
+        """The raw request body, or None once a refusal has been sent."""
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            self._write_json(400, {"ok": False, "error": "Invalid Content-Length"})
-            return
+            length = -1
+        if length < 0:
+            self._refuse(400, "Invalid Content-Length")
+            return None
+        if length > MAX_BODY:
+            self._refuse(413, "Request body is too large")
+            return None
+        # Read before any refusal, so the client gets the reply instead of a reset connection.
+        return self.rfile.read(length)
 
-        if length <= 0:
-            self._write_json(400, {"ok": False, "error": "Request body is required"})
-            return
+    def _authorize(self):
+        """Path segments after the session token, or None once a refusal has been sent."""
+        if self.headers.get("Origin"):
+            self._refuse(403, "Requests from web pages are not accepted")
+            return None
+        parts = [part for part in self.path.split("?", 1)[0].split("/") if part]
+        token = getattr(self.server, "token", "")
+        if not parts or not secrets.compare_digest(parts[0].encode(), token.encode()):
+            self._refuse(403, (
+                "Missing or wrong session token. "
+                "Ctrl-click the bridge icon in Blender and paste the fresh instructions"
+            ))
+            return None
+        return parts[1:]
 
-        try:
-            code = self.rfile.read(length).decode("utf-8")
-        except UnicodeDecodeError:
-            self._write_json(400, {"ok": False, "error": "Request body must be UTF-8"})
-            return
-
-        stream_q = queue.Queue()
-        with _queue_lock:
-            if self.server is not _server:
-                self._write_json(503, {"ok": False, "error": "Bridge stopped; copy fresh instructions"})
-                return
-            request_queue.put((next(_request_ids), code, stream_q))
-
+    def _format(self):
         accept = self.headers.get("Accept", "")
         if "application/x-ndjson" in accept:
-            self._do_streaming(stream_q)
+            return "ndjson"
+        return "json" if "application/json" in accept else "text"
+
+    def _reply(self, job):
+        """Wait for the job, then answer: 200 finished, 500 the Python failed, 504 not finished yet."""
+        style = self._format()
+        deadline = time.monotonic() + _timeout
+        if style == "ndjson":
+            self._stream(job, deadline)
+            return
+        for _ in job.follow(deadline):
+            pass
+        reply, output = _describe(job, _url(self.server))
+        status = 200 if reply["ok"] else 500 if reply["state"] == "done" else 504
+        if style == "json":
+            self._send(status, json.dumps(reply), "application/json")
         else:
-            self._do_buffered(stream_q)
+            self._send(status, _as_text(reply, output), "text/plain; charset=utf-8")
 
-    # -- Streaming: chunked NDJSON, real-time output --------------------
-
-    def _do_streaming(self, stream_q):
+    def _stream(self, job, deadline):
+        """One JSON line per piece of output as it is printed, then a final `result` line."""
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
-        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
         self.end_headers()
+        for channel, text in job.follow(deadline):
+            self._write_line({"channel": channel, "data": text})
+        reply, _ = _describe(job, _url(self.server))
+        del reply["stdout"], reply["stderr"]
+        self._write_line({"channel": "result", **reply})
 
-        deadline = time.monotonic() + _get_timeout()
-        try:
-            while True:
-                remaining = max(0.0, deadline - time.monotonic())
-                try:
-                    channel, data = stream_q.get(timeout=remaining)
-                except queue.Empty:
-                    timeout_val = _get_timeout()
-                    self._write_chunk(json.dumps({
-                        "channel": "result",
-                        "ok": False,
-                        "error": (
-                            f"Bridge timeout: command exceeded {timeout_val:.0f}s limit. "
-                            "Increase timeout in addon preferences."
-                        ),
-                    }) + "\n")
-                    return
-
-                if channel == _STREAM_DONE:
-                    self._write_chunk(
-                        json.dumps({"channel": "result", **data}) + "\n"
-                    )
-                    return
-                else:
-                    self._write_chunk(
-                        json.dumps({"channel": channel, "data": data}) + "\n"
-                    )
-        finally:
-            self._end_chunked()
-
-    def _write_chunk(self, text):
-        encoded = text.encode("utf-8")
-        self.wfile.write(f"{len(encoded):x}\r\n".encode())
-        self.wfile.write(encoded)
-        self.wfile.write(b"\r\n")
+    def _write_line(self, payload):
+        self.wfile.write((json.dumps(payload) + "\n").encode("utf-8"))
         self.wfile.flush()
 
-    def _end_chunked(self):
-        self.wfile.write(b"0\r\n\r\n")
-        self.wfile.flush()
+    def _refuse(self, status, message):
+        if self._format() == "text":
+            self._send(status, f"[bridge] {message}\n", "text/plain; charset=utf-8")
+        else:
+            self._send(status, json.dumps({"ok": False, "error": message}), "application/json")
 
-    # -- Buffered: classic single JSON response -------------------------
-
-    def _do_buffered(self, stream_q):
-        deadline = time.monotonic() + _get_timeout()
-        stdout_parts = []
-        stderr_parts = []
-
-        while True:
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                channel, data = stream_q.get(timeout=remaining)
-            except queue.Empty:
-                timeout_val = _get_timeout()
-                self._write_json(504, {
-                    "ok": False,
-                    "error": (
-                        f"Bridge timeout: command exceeded {timeout_val:.0f}s limit. "
-                        "Increase timeout in addon preferences "
-                        "(Edit > Preferences > Add-ons > Blender Bridge) "
-                        "if running long operations."
-                    ),
-                })
-                return
-
-            if channel == _STREAM_DONE:
-                data["stdout"] = "".join(stdout_parts)
-                data["stderr"] = "".join(stderr_parts)
-                self._write_json(200, data)
-                return
-            elif channel == "stdout":
-                stdout_parts.append(data)
-            elif channel == "stderr":
-                stderr_parts.append(data)
-
-    def log_message(self, format, *args):
-        return
-
-    def _write_json(self, status, payload):
-        body = json.dumps(payload).encode("utf-8")
+    def _send(self, status, text, content_type):
+        body = text.encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def log_message(self, format, *args):
+        return
+
+
+# --- Server ---
 
 def _start_server():
     global _server, _server_thread, _active
     if _server is not None:
         return
     port = _get_port()
-    _clear_queue(request_queue)
     # Bind directly: probing then binding would race other Blender instances.
     for candidate in chain(range(port, 65536), range(1024, port)):
         if candidate in _retired_ports:
             continue
         try:
-            _server = ThreadingHTTPServer(("127.0.0.1", candidate), _BridgeHandler)
+            server = ThreadingHTTPServer(("127.0.0.1", candidate), _BridgeHandler)
             break
         except OSError as exc:
             if exc.errno != errno.EADDRINUSE:
                 raise
     else:
         raise OSError("No available Blender Bridge port")
-    port = _server.server_port
-    _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
+    # A fresh token per start: stale instructions and other local callers get a refusal.
+    server.token = secrets.token_urlsafe(9)
+    _sync()
+    _server = server
+    _server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     _server_thread.start()
     _active = True
     if not bpy.app.timers.is_registered(_poll):
         bpy.app.timers.register(_poll, first_interval=POLL_INTERVAL, persistent=True)
-    print(f"Blender Bridge listening for HTTP POST on http://127.0.0.1:{port}")
+    _console(f"Blender Bridge listening for HTTP POST on {_url()}")
 
 
 def _stop_server():
@@ -245,30 +452,35 @@ def _stop_server():
     with _queue_lock:
         server = _server
         _server = None
-        while not request_queue.empty():
-            _, _, stream_q = request_queue.get_nowait()
-            stream_q.put((_STREAM_DONE, {"ok": False, "error": "Bridge stopped before execution"}))
+        while True:
+            try:
+                request_queue.get_nowait().finish(False, "Bridge stopped before execution")
+            except queue.Empty:
+                break
+        _jobs.clear()
     if server is not None:
         server.shutdown()
         server.server_close()
     if _server_thread is not None:
         _server_thread.join(timeout=1.0)
         _server_thread = None
-    _clear_queue(request_queue)
     _active = False
-    print("Blender Bridge stopped")
+    _console("Blender Bridge stopped")
 
 
 def _poll():
     if _server is None:
         return None
-
     try:
-        request_id, code, stream_q = request_queue.get_nowait()
-    except queue.Empty:
-        return POLL_INTERVAL
-
-    _execute_code(code, stream_q)
+        _sync()
+        try:
+            job = request_queue.get_nowait()
+        except queue.Empty:
+            return POLL_INTERVAL
+        _execute(job)
+    except Exception:
+        # An error here would silently remove the timer and leave the bridge accepting requests it never runs.
+        traceback.print_exc()
     return POLL_INTERVAL
 
 
@@ -289,7 +501,7 @@ def _load_post(_filepath):
         try:
             _start_server()
         except OSError as exc:
-            print(f"Blender Bridge could not restart: {exc}")
+            _console(f"Blender Bridge could not restart: {exc}")
 
 
 # --- Terminal ---
@@ -362,7 +574,8 @@ class BRIDGE_OT_toggle(bpy.types.Operator):
             except OSError as exc:
                 self.report({'ERROR'}, f"Could not start Blender Bridge: {exc}")
                 return {'CANCELLED'}
-        for area in context.screen.areas:
+        # No screen when started from the command line (--python-expr).
+        for area in (context.screen.areas if context.screen else ()):
             if area.type == 'TOPBAR':
                 area.tag_redraw()
         return {'FINISHED'}
@@ -396,9 +609,12 @@ class BRIDGE_OT_copy_instructions(bpy.types.Operator):
         except FileNotFoundError:
             pass
 
+        text = text.replace("{{URL}}", _url())
         text = text.replace("{{PORT}}", str(port))
+        text = text.replace("{{TOKEN}}", _server.token)
         text = text.replace("{{FILE}}", json.dumps(bpy.data.filepath or "(unsaved)", ensure_ascii=False))
         text = text.replace("{{TIMEOUT}}", f"{_get_timeout():g}")
+        text = text.replace("{{VERSION}}", _BLENDER)
 
         context.window_manager.clipboard = text
         return {'FINISHED'}
@@ -419,7 +635,7 @@ class BridgePreferences(bpy.types.AddonPreferences):
 
     port: bpy.props.IntProperty(
         name="Port",
-        default=9876,
+        default=DEFAULT_PORT,
         min=1024,
         max=65535,
         description="Preferred starting port; occupied ports are skipped automatically",
@@ -430,7 +646,10 @@ class BridgePreferences(bpy.types.AddonPreferences):
         default=60.0,
         min=1.0,
         soft_max=3600.0,
-        description="HTTP response wait limit; timeout does not cancel Python execution",
+        description=(
+            "How long a reply waits for a request to finish. "
+            "Slower requests keep running and can be collected later"
+        ),
     )
 
     def draw(self, context):
@@ -476,6 +695,8 @@ def unregister():
     global _restart_after_load
     _restart_after_load = False
     _stop_server()
+    while _sources:
+        linecache.cache.pop(_sources.popleft(), None)
     bpy.app.handlers.load_pre.remove(_load_pre)
     bpy.app.handlers.load_post.remove(_load_post)
     bpy.app.handlers.load_post_fail.remove(_load_post)

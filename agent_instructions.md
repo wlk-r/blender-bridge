@@ -1,22 +1,51 @@
-Connect to the running Blender Bridge at `http://127.0.0.1:{{PORT}}` for file {{FILE}}. Use this endpoint only; other ports may control other Blender files. If it stops responding, ask for fresh Ctrl-click instructions rather than switching ports.
+You are connected to a live Blender {{VERSION}} session through Blender Bridge at `{{URL}}`, file {{FILE}}. The user may be working in the same session while you do. Use only this URL: it carries this session's token, and other ports belong to other Blender files. If it stops responding or answers 403, ask for fresh Ctrl-click instructions rather than trying other ports.
 
-Send UTF-8 Python source as the raw HTTP POST body. `bpy` is already available; execution happens on Blender's main thread. No MCP setup or extra packages are needed.
-
-Start with this read-only check (macOS/Linux):
+POST Python source as the raw request body. It runs on Blender's main thread with `bpy` already imported; no MCP setup or extra packages are needed. Start with this read-only check (macOS/Linux):
 ```sh
-curl --silent --show-error --noproxy '*' http://127.0.0.1:{{PORT}} --data-binary 'print({"file": bpy.data.filepath, "version": bpy.app.version_string, "scene": bpy.context.scene.name, "mode": bpy.context.mode})'
+curl -sS --noproxy '*' {{URL}} --data-binary 'print({"file": bpy.data.filepath, "scene": bpy.context.scene.name, "mode": bpy.context.mode, "active": getattr(bpy.context.active_object, "name", None), "selected": [o.name for o in bpy.context.selected_objects]})'
 ```
 PowerShell:
 ```powershell
-Invoke-RestMethod -Uri 'http://127.0.0.1:{{PORT}}' -Method Post -ContentType 'text/plain; charset=utf-8' -Body 'print({"file": bpy.data.filepath, "version": bpy.app.version_string, "scene": bpy.context.scene.name, "mode": bpy.context.mode})'
+Invoke-RestMethod -Uri '{{URL}}' -Method Post -ContentType 'text/plain; charset=utf-8' -Body 'print({"file": bpy.data.filepath, "scene": bpy.context.scene.name, "mode": bpy.context.mode, "active": getattr(bpy.context.active_object, "name", None), "selected": [o.name for o in bpy.context.selected_objects]})'
 ```
-Verify the returned file matches the intended task before editing. If no task has been given, report the connection and wait for one.
+Confirm the file is the one you expect before editing. If you have no task yet, report the connection and wait.
 
-- For multiline scripts, write a UTF-8 file and use `curl ... --data-binary @script.py` to preserve newlines and avoid shell quoting problems.
-- Responses contain `ok`, `stdout`, `stderr`, and `error` on failure. Check `ok`; Python errors can still return HTTP 200. Use `print()` for results. Each request has a fresh Python namespace; scene changes persist.
-- For live output, add `--no-buffer -H 'Accept: application/x-ndjson'` to curl. Lines contain `channel: stdout/stderr` with `data`, followed by `channel: result` with `ok` and optional `error`. A disconnected stream without a result is not confirmation of success.
-- Inspect relevant scene state before changing it. Prefer the data API; operators may require a particular mode, selection, active object, or editor context. Use the installed Blender version's API.
-- Do not guess API names; ask the live session. `dir(x)`, `x.__doc__`, `[p.identifier for p in x.bl_rna.properties]` for data-block fields, `bpy.ops.a.b.get_rna_type().properties.keys()` for operator arguments. Print only the slice you need; `help()` output is large.
-- When a visual check is necessary or helpful, use the fastest suitable method: a viewport screenshot for quick checks, a viewport render for a clean preview, or an engine render for final appearance. Prefer inspecting scene data to analyze progress unless visual verification is directly applicable.
-- Send one command at a time. Python and synchronous rendering block Blender's UI; avoid sleeps and busy-wait loops. The current response timeout is {{TIMEOUT}} seconds (adjustable in addon preferences). A timeout does not cancel queued or running code: do not blindly retry edits.
-- Stay within the user's task. Do not clear the scene, overwrite files, save, or close Blender unless the task authorizes it. Opening another file rotates the bridge port; request fresh instructions afterward.
+## Sending code
+- For anything longer than one line, pipe a quoted heredoc so the shell cannot alter the code: `curl -sS --noproxy '*' {{URL}} --data-binary @- <<'PY'`, then the script, then `PY`. Keep a script you will revise in a file and send it with `--data-binary @script.py`.
+- The reply is plain text: whatever the script printed, followed by the traceback if it failed. The HTTP status is 200 on success and 500 on a Python error; add `--fail-with-body` if you want curl's exit code to show it. Lines starting with `[bridge]` come from the bridge, not from your script. For one JSON object instead (`ok`, `stdout`, `stderr`, `error`), add `-H 'Accept: application/json'`.
+- Each request runs as `__main__` in a fresh namespace holding only `bpy`. Scene changes persist; variables, functions and imports do not.
+
+## How code runs here
+- Code runs from a timer, not from an editor. `bpy.context.window`, `scene`, `view_layer`, `active_object` and `selected_objects` work, but `area` and `region` are `None`, so operators that need a viewport or editor must run inside `bpy.context.temp_override(window=..., area=..., region=...)`. The snippet under "Seeing your work" shows the pattern.
+- Prefer the data API and `bmesh` for edits: they do not depend on selection or editor context. Check `bpy.context.mode` first. While an object is in Edit Mode its mesh data is stale and direct changes to it are discarded on exit, so use `bmesh.from_edit_mesh`, or leave Edit Mode and return to it afterwards.
+- Your changes are not undo steps on their own. End every script that changes the scene with `bpy.ops.ed.undo_push(message="Bridge: <what changed>")`. Without it, the user's next undo removes your work along with their own last step, and redo does not bring it back.
+- Your memory of the API may come from another Blender version, so ask the live session instead of guessing: `dir(x)`, `x.__doc__`, `[p.identifier for p in x.bl_rna.properties]` for data-block fields, `bpy.ops.a.b.get_rna_type().properties.keys()` for operator arguments. Print only the slice you need; `help()` output is large.
+- Send one request at a time. Python and synchronous rendering block Blender's UI until they return, so avoid sleeps and busy-wait loops. A reply waits {{TIMEOUT}} seconds (adjustable in the add-on preferences). A slower request is not cancelled: you get HTTP 504 with its output so far and its request number. Do not send it again; `curl -sS --noproxy '*' {{URL}}/result/<number>` waits for it and returns its reply. `curl -sS --noproxy '*' {{URL}}` reports whether Blender is busy, even while a request is running. To watch a long job, add `--no-buffer -H 'Accept: application/x-ndjson'`: one JSON line per printed line, then a `result` line.
+
+## Seeing your work
+Use scene data for facts (names, counts, dimensions, transforms, modifiers) and an image for judgments (shape, proportion, shading, materials, composition). When a task changes how something looks, check an image at each milestone and before you report it done, from more than one angle for anything three-dimensional. Do not render after every edit.
+
+This saves what the user's 3D viewport currently shows. Open the PNG with your image tool.
+```python
+import bpy, os, tempfile
+path = os.path.join(tempfile.gettempdir(), "bridge_view.png")
+win = bpy.context.window_manager.windows[0]
+area = next(a for a in win.screen.areas if a.type == 'VIEW_3D')
+region = next(r for r in area.regions if r.type == 'WINDOW')
+r = bpy.context.scene.render
+saved = (r.resolution_x, r.resolution_y, r.resolution_percentage, r.filepath, r.image_settings.file_format)
+r.resolution_x, r.resolution_y, r.resolution_percentage = 960, 540, 100
+r.image_settings.file_format, r.filepath = 'PNG', path
+try:
+    with bpy.context.temp_override(window=win, area=area, region=region):
+        bpy.ops.render.opengl(write_still=True, view_context=True)
+finally:
+    r.resolution_x, r.resolution_y, r.resolution_percentage, r.filepath, r.image_settings.file_format = saved
+print(path)
+```
+`view_context=False` renders through `scene.camera` instead. To see another angle without moving the user's view, point a temporary camera there, render, then restore `scene.camera` and remove the temporary one. Avoid `bpy.ops.screen.screenshot` and `screenshot_area`: they save at full window resolution. For final appearance use `bpy.ops.render.render(write_still=True)` with a reduced `resolution_percentage`.
+
+## Working with the user
+- Their selection, active object, 3D cursor and mode are part of the request: "this" means whatever is selected. Leave selection, mode, current frame and viewport as you found them unless changing them is the task.
+- Stay within the task. Do not clear the scene, save, overwrite files, or close Blender unless the task calls for it. Name what you create and keep new work in its own collection so it is easy to find and to remove.
+- Loading another file restarts the bridge at a new URL. If your own request loaded the file, the reply ends with a `[bridge]` line giving the new URL; continue there. If the user loaded it, ask for fresh instructions.
