@@ -130,6 +130,14 @@ try:
     status, body = request(first, 'print(bridge.look())')
     assert status == 500 and "need Blender's window" in body, body
 
+    # Each image gets a file of its own, so two agents never read each other's; only the newest are kept.
+    import numpy
+    pixels = numpy.zeros((2, 3, 3), dtype=numpy.uint8)
+    kept = first.helpers.KEPT_IMAGES
+    saved = [Path(first.helpers._save(pixels, first.helpers._new_path('look'))) for _ in range(kept + 1)]
+    assert len(set(saved)) == kept + 1 and not saved[0].exists() and all(path.exists() for path in saved[1:])
+    assert saved[1].read_bytes().startswith(b'\x89PNG') and saved[1].parent == Path(bpy.app.tempdir)
+
     # Web pages are refused, unrun: a cross-site POST carries Origin, a rebound domain names itself in Host.
     marker = 'import bpy; bpy.app.driver_namespace["bridge_test_ran"] = True'
     for headers in ({'Origin': 'https://example.com'}, {'Host': f'evil.example:{first._get_port()}'}):

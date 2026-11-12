@@ -15,10 +15,14 @@ bridge.override(area_type='VIEW_3D')
     Context for operators that need an editor:
     `with bridge.override(): bpy.ops.view3d.view_selected()`
 
-Print the returned path and open the PNG with your image tool. Images use the
-viewport's current shading mode and need Blender's window (not --background).
+Print the returned path and open the PNG with your image tool. Each call writes a
+new file unless you pass `path`, so another agent's image never replaces yours.
+Images use the viewport's current shading mode and need Blender's window (not
+--background).
 """
 
+import collections
+import itertools
 import math
 import os
 import struct
@@ -43,6 +47,9 @@ VIEWS = {
 _FOV = math.radians(40)
 _MARGIN = 1.08
 _NOT_FRAMED = {'CAMERA', 'LIGHT', 'LIGHT_PROBE', 'SPEAKER', 'EMPTY'}
+KEPT_IMAGES = 32
+_image_numbers = itertools.count(1)
+_images = collections.deque()  # paths this session chose itself, oldest first
 
 
 def _area(area_type):
@@ -174,10 +181,24 @@ def _draw(shots, width, height):
     return images
 
 
-def _save(pixels, path, name):
+def _new_path(kind):
+    """A file of its own for each image: with one fixed name, an agent could open another agent's picture.
+
+    They go in Blender's session folder, which Blender removes when it quits; only the newest are kept.
+    """
+    path = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), f"bridge_{kind}_{next(_image_numbers)}.png")
+    _images.append(path)
+    while len(_images) > KEPT_IMAGES:
+        try:
+            os.remove(_images.popleft())
+        except OSError:
+            pass
+    return path
+
+
+def _save(pixels, path):
     """Write RGB bytes as a PNG. Done by hand: a Blender image data-block would count as a scene edit."""
     height, width = pixels.shape[:2]
-    path = path or os.path.join(tempfile.gettempdir(), name)
     rows = b"".join(b"\x00" + row.tobytes() for row in pixels)  # filter type 0 before each row
 
     def chunk(kind, body):
@@ -196,7 +217,7 @@ def view(path=None, size=960):
     rv3d = area.spaces.active.region_3d
     scale = min(1.0, size / max(region.width, region.height))
     width, height = max(1, round(region.width * scale)), max(1, round(region.height * scale))
-    return _save(_draw([(rv3d.view_matrix, rv3d.window_matrix, "")], width, height)[0], path, "bridge_view.png")
+    return _save(_draw([(rv3d.view_matrix, rv3d.window_matrix, "")], width, height)[0], path or _new_path("view"))
 
 
 def look(objects=None, views=("front", "right", "top", "persp"), size=384, path=None):
@@ -215,4 +236,4 @@ def look(objects=None, views=("front", "right", "top", "persp"), size=384, path=
         row, column = divmod(index, columns)
         y, x = row * (size + gap), column * (size + gap)
         sheet[y:y + size, x:x + size] = tile
-    return _save(sheet, path, "bridge_look.png")
+    return _save(sheet, path or _new_path("look"))

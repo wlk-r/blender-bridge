@@ -83,6 +83,10 @@ A request that changes the scene becomes one undo step, so **Ctrl+Z** takes back
 
 Without this, edits made from a script are not undo steps at all: your next undo would remove them together with your own last action, and redo would not restore them.
 
+## Several agents on one port
+
+More than one agent can use the same port. Requests share one queue and Blender runs them one at a time, each one whole, so they cannot corrupt each other; a request stuck behind a long one gets a `504` and collects its reply from `/result/<id>`. What agents share is everything between requests: selection, mode, the current frame, and a single undo history. The agent instructions tell agents to make each request complete in itself, to name their own work, and not to undo unless their step is the latest. Blender still does one thing at a time, so for real parallel work give each agent its own Blender and file.
+
 ## Visual feedback
 
 Requests get a `bridge` helper for looking at the scene. Its image functions save a PNG, return the path, and leave the scene, your viewport and the undo history untouched. The agent then opens the file with its own image tool.
@@ -93,7 +97,7 @@ Requests get a `bridge` helper for looking at the scene. Its image functions sav
 | `bridge.view()` | Saves what your 3D viewport shows now, at up to 960 px |
 | `bridge.override('VIEW_3D')` | A context for operators that need an editor, since requests run without one: `with bridge.override(): bpy.ops.view3d.view_selected()` |
 
-`bridge.look("Chair", views=("front", "left"), size=512)` picks the directions and the tile size. Images are drawn offscreen in the viewport's current shading mode, so they need Blender's window.
+`bridge.look("Chair", views=("front", "left"), size=512)` picks the directions and the tile size. Images are drawn offscreen in the viewport's current shading mode, so they need Blender's window. Each call writes a new file in Blender's session temp folder, which Blender empties when it quits; the newest 32 are kept.
 
 The agent instructions ask agents to use scene data for facts and an image for judgments, and to look at milestones rather than after every edit.
 

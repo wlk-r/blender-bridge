@@ -1,4 +1,4 @@
-You are connected to a live Blender {{VERSION}} session through Blender Bridge at `{{URL}}`, file {{FILE}}. The user may be working in the same session while you do. Use only this port: other ports may belong to other Blender files. If it stops responding, ask the user which port the bridge is on now rather than trying other ports. A GET of `{{URL}}` returns these instructions again.
+You are connected to a live Blender {{VERSION}} session through Blender Bridge at `{{URL}}`, file {{FILE}}. The user and other agents may be working in the same session while you do. Use only this port: other ports may belong to other Blender files. If it stops responding, ask the user which port the bridge is on now rather than trying other ports. A GET of `{{URL}}` returns these instructions again.
 
 POST Python source as the raw request body. It runs on Blender's main thread with `bpy` already imported; no MCP setup or extra packages are needed. Start with this read-only check (macOS/Linux):
 ```sh
@@ -18,19 +18,26 @@ Confirm the file is the one you expect before editing. If you have no task yet, 
 ## How code runs here
 - Code runs from a timer, not from an editor. `bpy.context.window`, `scene`, `view_layer`, `active_object` and `selected_objects` work, but `area` and `region` are `None`. Run operators that need a viewport or editor inside `with bridge.override('VIEW_3D'):`.
 - Prefer the data API and `bmesh` for edits: they do not depend on selection or editor context. Check `bpy.context.mode` first. While an object is in Edit Mode its mesh data is stale and direct changes to it are discarded on exit, so use `bmesh.from_edit_mesh`, or leave Edit Mode and return to it afterwards.
-- Each request that changes the scene becomes one undo step, so the user's Ctrl+Z takes back exactly that request. Make a request one coherent change and begin it with a comment line saying what it does: that line names the undo step. To take back your own last change, send `bpy.ops.ed.undo()`.
+- Each request that changes the scene becomes one undo step, so the user's Ctrl+Z takes back exactly that request. Make a request one coherent change and begin it with a comment line saying what it does: that line names the undo step. `bpy.ops.ed.undo()` takes back the latest step, which is yours only if nobody has changed the scene since; otherwise reverse your change with an explicit edit.
 - Your memory of the API may come from another Blender version, so ask the live session instead of guessing: `dir(x)`, `x.__doc__`, `[p.identifier for p in x.bl_rna.properties]` for data-block fields, `bpy.ops.a.b.get_rna_type().properties.keys()` for operator arguments. Print only the slice you need; `help()` output is large.
-- Send one request at a time. Python and synchronous rendering block Blender's UI until they return, so avoid sleeps and busy-wait loops. A reply waits {{TIMEOUT}} seconds (adjustable in the add-on preferences). A slower request is not cancelled: you get HTTP 504 with its output so far and its request number. Do not send it again; `curl -sS --noproxy '*' {{URL}}/result/<number>` waits for it and returns its reply. `curl -sS --noproxy '*' {{URL}}/status` reports whether Blender is busy, even while a request is running. To watch a long job, add `--no-buffer -H 'Accept: application/x-ndjson'`: one JSON line per printed line, then a `result` line.
+- Send one request at a time. Requests from everyone on this port share one queue, so yours may wait behind another. Python and synchronous rendering block Blender's UI until they return, so avoid sleeps and busy-wait loops. A reply waits {{TIMEOUT}} seconds (adjustable in the add-on preferences). A slower request is not cancelled: you get HTTP 504 with its output so far and its request number. Do not send it again; `curl -sS --noproxy '*' {{URL}}/result/<number>` waits for it and returns its reply. `curl -sS --noproxy '*' {{URL}}/status` reports whether Blender is busy, even while a request is running. To watch a long job, add `--no-buffer -H 'Accept: application/x-ndjson'`: one JSON line per printed line, then a `result` line.
 
 ## Seeing your work
 Use scene data for facts (names, counts, dimensions, transforms, modifiers) and an image for judgments (shape, proportion, shading, materials, composition). When a task changes how something looks, check an image at each milestone and before you report it done, from more than one angle for anything three-dimensional. Do not render after every edit.
 
 - `bridge.look(objects)` saves one labelled image of those objects from the front, right, top and a perspective angle, framed to fit, without moving the user's view. Pass objects or names; with no argument it frames everything visible. Walls in front of the objects are clipped away.
 - `bridge.view()` saves what the user's 3D viewport shows now.
-- Both return the PNG path: print it, then open the file with your image tool. `print(bridge.__doc__)` lists the options.
+- Both return the path of a new PNG: print it, then open the file with your image tool. `print(bridge.__doc__)` lists the options.
 - For final appearance use `bpy.ops.render.render(write_still=True)` with a reduced `resolution_percentage`.
+
+## Sharing the session
+Requests run one at a time and each runs whole, but the user or another agent can change the scene between two of yours.
+- Make each request complete in itself. Do not rely on the selection, active object, mode or frame an earlier request left: look objects up by name and set what you need in the same request.
+- Put back what you change temporarily (mode, frame, render settings) before the request ends. An object left in Edit Mode loses the direct mesh edits anyone else makes to it.
+- Give your collection and objects names specific to your task, not `Cube` or `New`, and read back the name Blender gave: a taken name becomes `Name.001`. Change only what your task covers.
+- Render to a file path of your own, set and restored in the same request: `scene.render.filepath` is shared.
 
 ## Working with the user
 - Their selection, active object, 3D cursor and mode are part of the request: "this" means whatever is selected. Leave selection, mode, current frame and viewport as you found them unless changing them is the task.
 - Stay within the task. Do not clear the scene, save, overwrite files, or close Blender unless the task calls for it. Name what you create and keep new work in its own collection so it is easy to find and to remove.
-- Loading another file restarts the bridge on a new port. If your own request loaded the file, the reply ends with a `[bridge]` line giving the new URL; continue there. If the user loaded it, ask them for the new port.
+- Loading another file restarts the bridge on a new port and cuts off every other agent, so do it only when the user asks. If your own request loaded the file, the reply ends with a `[bridge]` line giving the new URL; continue there. If the user loaded it, ask them for the new port.
